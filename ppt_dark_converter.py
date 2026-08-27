@@ -7,7 +7,7 @@ from xml.etree import ElementTree as ET
 
 from PIL import Image, UnidentifiedImageError
 
-from dark_mode import convert_to_dark_mode
+from dark_mode import convert_to_dark_mode, convert_to_light_mode
 
 
 PML = "http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -19,10 +19,11 @@ ET.register_namespace("a", DML)
 ET.register_namespace("p", PML)
 
 
-def _darken_media(data: bytes, suffix: str) -> bytes:
+def _convert_media(data: bytes, suffix: str, target_mode: str) -> bytes:
     try:
         with Image.open(io.BytesIO(data)) as source:
-            converted = convert_to_dark_mode(source, preserve_colors=True)
+            converter = convert_to_dark_mode if target_mode == "dark" else convert_to_light_mode
+            converted = converter(source, preserve_colors=True)
     except UnidentifiedImageError:
         return data
 
@@ -34,7 +35,7 @@ def _darken_media(data: bytes, suffix: str) -> bytes:
     return output.getvalue()
 
 
-def _set_dark_slide_background(xml_bytes: bytes) -> bytes:
+def _set_slide_background(xml_bytes: bytes, target_mode: str) -> bytes:
     root = ET.fromstring(xml_bytes)
     common_slide_data = root.find(f"{{{PML}}}cSld")
     if common_slide_data is None:
@@ -47,14 +48,17 @@ def _set_dark_slide_background(xml_bytes: bytes) -> bytes:
     background = ET.Element(f"{{{PML}}}bg")
     properties = ET.SubElement(background, f"{{{PML}}}bgPr")
     solid = ET.SubElement(properties, f"{{{DML}}}solidFill")
-    ET.SubElement(solid, f"{{{DML}}}srgbClr", {"val": "0A0A0A"})
+    color = "0A0A0A" if target_mode == "dark" else "FFFFFF"
+    ET.SubElement(solid, f"{{{DML}}}srgbClr", {"val": color})
     ET.SubElement(properties, f"{{{DML}}}effectLst")
     common_slide_data.insert(0, background)
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def convert_pptx_to_dark_mode(pptx_bytes: bytes) -> bytes:
-    """PPTX의 래스터 이미지와 각 슬라이드 배경을 다크 모드로 변환한다."""
+def convert_pptx_mode(pptx_bytes: bytes, target_mode: str) -> bytes:
+    """PPTX의 래스터 이미지와 배경을 지정한 모드로 변환한다."""
+    if target_mode not in {"dark", "light"}:
+        raise ValueError("target_mode는 dark 또는 light여야 합니다.")
     source_buffer = io.BytesIO(pptx_bytes)
     if not zipfile.is_zipfile(source_buffer):
         raise ValueError("올바른 PowerPoint(.pptx) 파일이 아닙니다.")
@@ -77,12 +81,20 @@ def convert_pptx_to_dark_mode(pptx_bytes: bytes) -> bytes:
                 data = source.read(entry.filename)
                 lower = entry.filename.lower()
                 if lower.startswith("ppt/media/") and lower.endswith((".png", ".jpg", ".jpeg")):
-                    data = _darken_media(data, "." + lower.rsplit(".", 1)[-1])
+                    data = _convert_media(data, "." + lower.rsplit(".", 1)[-1], target_mode)
                     converted_images += 1
                 elif lower.startswith("ppt/slides/slide") and lower.endswith(".xml"):
-                    data = _set_dark_slide_background(data)
+                    data = _set_slide_background(data, target_mode)
                 destination.writestr(entry, data)
 
     if converted_images == 0:
         raise ValueError("변환할 PNG/JPEG 문제 이미지를 PPT에서 찾지 못했습니다.")
     return output_buffer.getvalue()
+
+
+def convert_pptx_to_dark_mode(pptx_bytes: bytes) -> bytes:
+    return convert_pptx_mode(pptx_bytes, "dark")
+
+
+def convert_pptx_to_light_mode(pptx_bytes: bytes) -> bytes:
+    return convert_pptx_mode(pptx_bytes, "light")

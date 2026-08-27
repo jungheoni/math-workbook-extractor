@@ -16,8 +16,8 @@ from 필수유형_extractor import extract as extract_essential_types
 from 라이트유형_extractor import extract as extract_light_types
 from 테스트북_extractor import extract as extract_test_book
 from pptx_exporter import export_pptx
-from ppt_dark_converter import convert_pptx_to_dark_mode
-from pdf_dark_converter import convert_pdf_to_dark_outputs
+from ppt_dark_converter import convert_pptx_mode
+from pdf_dark_converter import convert_pdf_outputs
 
 
 BOOKS = {
@@ -203,9 +203,9 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown('<div class="work-panel">', unsafe_allow_html=True)
 st.markdown('<div class="section-label">PDF · PPT 다크 모드 변환</div>', unsafe_allow_html=True)
-st.caption("흰 배경의 PDF 또는 이미지 기반 PowerPoint를 올리면 다크 모드 파일로 변환합니다. PDF는 다크 PDF와 PPT를 모두 제공합니다.")
+st.caption("PDF 또는 이미지 기반 PowerPoint를 올리고 변환 방향을 선택하세요. PDF는 변환된 PDF와 PPT를 모두 제공합니다.")
 dark_ppt_upload = st.file_uploader(
-    "흰 배경 PDF 또는 PowerPoint",
+    "PDF 또는 PowerPoint",
     type=("pdf", "pptx"),
     accept_multiple_files=False,
     key="dark_ppt_upload",
@@ -215,40 +215,48 @@ dark_ppt_signature = (
     dark_ppt_upload.size,
 ) if dark_ppt_upload is not None else (None, 0)
 if st.session_state.get("dark_ppt_signature") != dark_ppt_signature:
-    for key in ("converted_dark_pptx", "converted_dark_pptx_name", "converted_dark_pdf", "converted_dark_pdf_name"):
+    for key in ("converted_dark_pptx", "converted_dark_pptx_name", "converted_dark_pdf", "converted_dark_pdf_name", "converted_mode_name"):
         st.session_state.pop(key, None)
     st.session_state["dark_ppt_signature"] = dark_ppt_signature
 
-if st.button("다크 모드 파일 만들기", disabled=dark_ppt_upload is None, type="primary"):
+dark_button, light_button = st.columns(2)
+with dark_button:
+    make_dark = st.button("다크 모드로 변환", disabled=dark_ppt_upload is None, type="primary")
+with light_button:
+    make_light = st.button("라이트 모드로 변환", disabled=dark_ppt_upload is None, type="secondary")
+
+if make_dark or make_light:
     if dark_ppt_upload is not None:
         try:
             with st.spinner("페이지 이미지와 배경을 변환하고 있습니다…"):
                 stem = Path(dark_ppt_upload.name).stem
+                target_mode = "dark" if make_dark else "light"
+                mode_name = "다크모드" if target_mode == "dark" else "라이트모드"
                 if Path(dark_ppt_upload.name).suffix.lower() == ".pdf":
-                    with tempfile.TemporaryDirectory(prefix="dark-pdf-") as temporary:
-                        dark_pdf, dark_pptx = convert_pdf_to_dark_outputs(
-                            dark_ppt_upload.getvalue(), Path(temporary)
+                    with tempfile.TemporaryDirectory(prefix=f"{target_mode}-pdf-") as temporary:
+                        converted_pdf, converted_pptx = convert_pdf_outputs(
+                            dark_ppt_upload.getvalue(), Path(temporary), target_mode
                         )
-                    st.session_state["converted_dark_pdf"] = dark_pdf
-                    st.session_state["converted_dark_pdf_name"] = f"{stem}_다크모드.pdf"
-                    st.session_state["converted_dark_pptx"] = dark_pptx
+                    st.session_state["converted_dark_pdf"] = converted_pdf
+                    st.session_state["converted_dark_pdf_name"] = f"{stem}_{mode_name}.pdf"
+                    st.session_state["converted_dark_pptx"] = converted_pptx
                 else:
-                    st.session_state["converted_dark_pptx"] = convert_pptx_to_dark_mode(
-                        dark_ppt_upload.getvalue()
-                    )
-                st.session_state["converted_dark_pptx_name"] = f"{stem}_다크모드.pptx"
+                    st.session_state.pop("converted_dark_pdf", None)
+                    st.session_state["converted_dark_pptx"] = convert_pptx_mode(dark_ppt_upload.getvalue(), target_mode)
+                st.session_state["converted_dark_pptx_name"] = f"{stem}_{mode_name}.pptx"
+                st.session_state["converted_mode_name"] = mode_name
         except Exception as error:
             for key in ("converted_dark_pptx", "converted_dark_pdf"):
                 st.session_state.pop(key, None)
             st.error(f"다크 모드 변환 중 문제가 생겼습니다: {error}")
 
 if "converted_dark_pptx" in st.session_state:
-    st.success("다크 모드 파일이 준비됐습니다.")
+    st.success(f'{st.session_state.get("converted_mode_name", "변환")} 파일이 준비됐습니다.')
     download_columns = st.columns(2) if "converted_dark_pdf" in st.session_state else [st.container()]
     if "converted_dark_pdf" in st.session_state:
         with download_columns[0]:
             st.download_button(
-                "다크 모드 PDF 다운로드",
+                f'{st.session_state.get("converted_mode_name", "변환")} PDF 다운로드',
                 data=st.session_state["converted_dark_pdf"],
                 file_name=st.session_state["converted_dark_pdf_name"],
                 mime="application/pdf",
@@ -256,7 +264,7 @@ if "converted_dark_pptx" in st.session_state:
             )
     with download_columns[-1]:
         st.download_button(
-            "다크 모드 PowerPoint 다운로드",
+            f'{st.session_state.get("converted_mode_name", "변환")} PowerPoint 다운로드',
             data=st.session_state["converted_dark_pptx"],
             file_name=st.session_state["converted_dark_pptx_name"],
             mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",

@@ -39,6 +39,31 @@ def convert_to_dark_mode(
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
 
 
+def convert_to_light_mode(
+    image: Image.Image,
+    background: tuple[int, int, int] = (250, 250, 250),
+    foreground: tuple[int, int, int] = (15, 15, 15),
+    preserve_colors: bool = True,
+) -> Image.Image:
+    """다크 문서의 배경과 무채색 요소를 라이트 모드로 되돌린다."""
+    arr = np.array(image.convert("RGB"), dtype=np.float32)
+    brightness = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    color_range = arr.max(axis=2) - arr.min(axis=2)
+    grayscale_mask = color_range < 30
+    inverted = (255.0 - brightness) / 255.0
+    for channel in range(3):
+        mapped = foreground[channel] + inverted * (background[channel] - foreground[channel])
+        arr[:, :, channel][grayscale_mask] = mapped[grayscale_mask]
+
+    color_mask = ~grayscale_mask
+    if preserve_colors:
+        bright_color_mask = color_mask & (brightness > 170)
+        arr[bright_color_mask] = np.clip(arr[bright_color_mask] * 0.68, 0, 255)
+    else:
+        arr[color_mask] = 255 - arr[color_mask]
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
+
+
 def convert_images_in_place(paths: list[Path]) -> list[Path]:
     """PNG 목록을 같은 파일명으로 안전하게 다크 모드 변환한다."""
     converted: list[Path] = []

@@ -3,3 +3,4 @@ pypdfium2>=4.30,<5
 Pillow>=10,<13
 numpy>=1.26,<3
 streamlit>=1.49,<2
+reportlab>=4,<5

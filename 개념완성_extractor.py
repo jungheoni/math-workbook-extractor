@@ -66,8 +66,15 @@ def examples(page,image,out,pno):
         box=tight(page,left,right,top-3,end)
         # 도형이 풀이 행보다 아래까지 내려오는 예제는 도형을 살리되 왼쪽 풀이 글자만 지운다.
         if kind=="예제" and stops and box is not None and box[3]>end:
-            cleaned=image.copy(); sx=image.width/page.width; sy=image.height/page.height
-            ImageDraw.Draw(cleaned).rectangle((int(left*sx),int(end*sy),int((left+(right-left)*.58)*sx),int(box[3]*sy)+2),fill="white")
+            cleaned=image.copy()
+            # PDF마다 CropBox 원점이 달라질 수 있다. 자르기와 같은 좌표 변환을
+            # 사용하지 않으면 풀이 삭제 마스크가 위로 이동해 발문을 가린다.
+            mask_box=pdf_box_to_pixels(
+                page,
+                image,
+                (left, end, left+(right-left)*.58, box[3]),
+            )
+            ImageDraw.Draw(cleaned).rectangle(mask_box,fill="white")
             path=save(page,cleaned,box,out,f"{pno:03d}p_{serial:03d}_{kind}.png")
         else:
             path=save(page,image,box,out,f"{pno:03d}p_{serial:03d}_{kind}.png")

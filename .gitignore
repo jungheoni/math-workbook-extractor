@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# 로컬 처리 결과와 임시 파일
+output/
+tmp/
+sources/
+*_progress.json
+*_metadata.json
+*.part
+
+# 사용자 업로드·생성 결과
+*.pdf
+*.pptx
+*.zip
+
+# 편집기/운영체제
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -19,23 +19,12 @@ def norm(value: object) -> str:
 
 
 def remove_teacher_blue(image: Image.Image) -> Image.Image:
-    """교사용 미리보기에 덧인쇄된 파랑/청록 표시만 흰색으로 지운다.
-
-    라이트유형의 초록색 문제 번호는 RGB상 초록 성분이 파랑보다 강하다.
-    기존 조건은 이 안티앨리어싱 픽셀까지 청록색으로 오인해 번호 가장자리를
-    지웠다. 따라서 '파랑이 초록보다 확실히 강한' 픽셀만 제거한다.
-    """
+    """교사용 미리보기에 덧인쇄된 청록색 정답 표시만 흰색으로 지운다."""
     rgb = np.asarray(image.convert("RGB")).copy()
     red = rgb[..., 0].astype(np.int16)
     green = rgb[..., 1].astype(np.int16)
     blue = rgb[..., 2].astype(np.int16)
-
-    mask = (
-        (blue > 115)
-        & (green > 75)
-        & (blue - red > 35)
-        & (blue - green > 10)
-    )
+    mask = (blue > 100) & (green > 70) & (blue - red > 25) & (green - red > 15)
     rgb[mask] = 255
     return Image.fromarray(rgb, "RGB")
 
@@ -259,9 +248,7 @@ def concept_practice(page, rendered: Image.Image, output: Path, page_no: int) ->
         if not members:
             continue
         first_top = min(m.top for m in members)
-        # 첫 문제의 분수/수식은 번호보다 위에서 시작할 수 있으므로
-        # 통합 발문(header)이 첫 문제의 윗부분을 먹지 않도록 충분히 띄운다.
-        prompt_box = tight_box(page, col_left, col_right, float(range_word["top"]) - 3, first_top - 14)
+        prompt_box = tight_box(page, col_left, col_right, float(range_word["top"]) - 3, first_top - 4)
         if prompt_box is None:
             continue
         header = crop(page, rendered, prompt_box)
@@ -275,16 +262,9 @@ def concept_practice(page, rendered: Image.Image, output: Path, page_no: int) ->
             same_lane = sorted([m for m in members if int(two_inner_columns and m.x0 >= split) == inner],
                                key=lambda m: m.top)
             position = same_lane.index(marker)
-            # 다음 문제의 분수/수식은 문제 번호보다 위에서 시작할 수 있다.
-            # 번호 직전까지만 자르면 다음 문제의 분자나 근호 윗부분이 섞이므로
-            # 다음 번호보다 14pt 먼저 종료한다.
-            end = (same_lane[position + 1].top - 14 if position + 1 < len(same_lane)
+            end = (same_lane[position + 1].top - 5 if position + 1 < len(same_lane)
                    else _next_range_top(groups, page.width / 2, col, float(range_word["top"]), page.height - 90))
-            # 분수/근호는 문제 번호의 기준선보다 위쪽으로 올라간다.
-            # marker.top 바로 위에서 자르면 분자의 윗부분이나 수식이 잘리므로
-            # 같은 행의 앞 문제를 침범하지 않는 범위에서 위쪽을 넉넉히 확보한다.
-            body_top = marker.top - 18
-            body_box = tight_box(page, left, right, body_top, end)
+            body_box = tight_box(page, left, right, marker.top - 4, end)
             if body_box is None:
                 continue
             serial += 1

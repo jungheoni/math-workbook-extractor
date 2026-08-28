@@ -25,13 +25,11 @@ from PIL import Image
 
 
 PROFILES = {
-    "pungsanja": {"digits": 3, "label": "풍산자", "top_padding": 0.0},
+    "pungsanja": {"digits": 3, "label": "풍산자"},
     # 구판은 색상 2자리, 신판은 회색 2자리+색상 1자리의 3자리 번호다.
-    # 최고난도는 번호 글자의 실제 렌더링 영역이 PDF 텍스트 bbox보다 위로
-    # 조금 더 올라가는 경우가 있어, 번호 상단이 잘리지 않도록 6pt를 추가한다.
-    "최고난도": {"digits": (3, 2), "label": "최고난도", "top_padding": 6.0},
+    "최고난도": {"digits": (3, 2), "label": "최고난도"},
     # 이전 실행 명령과 진행 기록을 위한 호환 별칭
-    "choegonado": {"digits": (3, 2), "label": "최고난도", "top_padding": 6.0},
+    "choegonado": {"digits": (3, 2), "label": "최고난도"},
 }
 STOP_WORDS = ("풍산자曰", "풀이", "해설", "정답")
 SOLUTION_PATTERNS = (
@@ -277,7 +275,6 @@ def determine_problem_box(
     right: float,
     max_gap: float,
     source_padding: float,
-    top_padding: float = 0.0,
 ) -> tuple[float, float, float, float] | None:
     footer_limit = page.height - 90
     hard_end = min(next_marker.top if next_marker else footer_limit, footer_limit)
@@ -350,18 +347,7 @@ def determine_problem_box(
         return None
 
     x0 = max(left, min(box.x0 for box in connected) - source_padding)
-
-    # 일반 풍산자는 기존 크롭 위치를 유지한다.
-    # 최고난도처럼 번호의 실제 잉크 영역이 텍스트 bbox 위로 올라가는 교재는
-    # marker.top보다 추가로 위쪽을 포함해 번호 윗부분이 잘리지 않게 한다.
-    content_top = max(
-        marker.top - source_padding,
-        min(box.top for box in connected) - source_padding,
-    )
-    if top_padding > 0:
-        content_top = min(content_top, marker.top - top_padding)
-    top = max(0.0, content_top)
-
+    top = max(marker.top - source_padding, min(box.top for box in connected) - source_padding)
     x1 = min(right, max(box.x1 for box in connected) + source_padding)
     bottom = min(hard_end, max(box.bottom for box in connected) + source_padding)
     # A PDF can contain invisible/stray text on a card border. Never let that
@@ -440,22 +426,13 @@ def extract(
     if profile not in PROFILES:
         raise ValueError(f"알 수 없는 교재 프로필: {profile}")
     profile_settings = PROFILES[profile]
-    profile_top_padding = float(profile_settings.get("top_padding", 0.0))
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf = pdfium.PdfDocument(str(pdf_path))
     progress_path = output_dir.parent / f"{output_dir.name}_progress.json"
     metadata_path = output_dir.parent / f"{output_dir.name}_metadata.json"
     zip_path = output_dir.parent / f"{output_dir.name}.zip"
     signature = source_signature(pdf_path)
-    settings = {
-        "profile": profile,
-        "digits": profile_settings["digits"],
-        "scale": scale,
-        "max_gap": max_gap,
-        "source_padding": source_padding,
-        "pixel_margin": pixel_margin,
-        "top_padding": profile_top_padding,
-    }
+    settings = {"profile": profile, "digits": profile_settings["digits"], "scale": scale, "max_gap": max_gap}
     records: dict[str, dict] = {}
 
     if progress_path.is_file():
@@ -530,7 +507,6 @@ def extract(
                         right,
                         max_gap,
                         source_padding,
-                        profile_top_padding,
                     )
                     if box is None:
                         print(f"warning: could not determine problem {marker.number} on page {page_index + 1}")

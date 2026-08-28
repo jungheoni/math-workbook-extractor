@@ -6,7 +6,6 @@ from pathlib import Path
 import pdfplumber
 import pypdfium2 as pdfium
 from PIL import Image, ImageDraw
-import numpy as np
 from pungsanja_extractor import add_margin, is_colored_text, pdf_box_to_pixels
 
 @dataclass(frozen=True)
@@ -45,32 +44,12 @@ def tight(page,left,right,top,bottom):
     if not objs: return None
     return (max(left,min(x[0] for x in objs)-7),max(0,min(x[1] for x in objs)-4),min(right,max(x[2] for x in objs)+7),min(page.height,max(x[3] for x in objs)+4))
 
-def trim_white(image: Image.Image, padding: int = 10, threshold: int = 248) -> Image.Image:
-    """렌더링 결과의 불필요한 흰 여백을 제거한다.
-
-    PDF 오브젝트의 큰 외곽 상자 때문에 실제 내용보다 왼쪽/오른쪽 여백이
-    넓게 잡히는 경우를 마지막 단계에서 한 번 더 정리한다.
-    """
-    rgb = np.asarray(image.convert("RGB"))
-    ink = np.any(rgb < threshold, axis=2)
-    ys, xs = np.where(ink)
-    if len(xs) == 0:
-        return image
-    x0=max(0,int(xs.min())-padding); y0=max(0,int(ys.min())-padding)
-    x1=min(image.width,int(xs.max())+padding+1); y1=min(image.height,int(ys.max())+padding+1)
-    return image.crop((x0,y0,x1,y1))
-
 def save(page,image,box,out,name):
     if box is None: return None
-    raw=image.crop(pdf_box_to_pixels(page,image,box))
-    result=add_margin(trim_white(raw,10),24)
-    path=out/name; result.save(path,"PNG",optimize=True); return path
+    result=add_margin(image.crop(pdf_box_to_pixels(page,image,box)),24); path=out/name; result.save(path,"PNG",optimize=True); return path
 
 def stack(a,b):
-    a=trim_white(a,8); b=trim_white(b,8)
-    out=Image.new("RGB",(max(a.width,b.width),a.height+b.height+18),"white")
-    out.paste(a,(0,0)); out.paste(b,(0,a.height+18))
-    return trim_white(out,8)
+    out=Image.new("RGB",(max(a.width,b.width),a.height+b.height+18),"white"); out.paste(a,(0,0)); out.paste(b,(0,a.height+18)); return out
 
 def labels(page,label): return [w for w in words(page) if norm(w["text"]).startswith(label)]
 
@@ -80,28 +59,11 @@ def examples(page,image,out,pno):
     for serial,(w,kind) in enumerate(labs,1):
         x=float(w["x0"]); top=float(w["top"]); col=int(x>=mid); left=55 if not col else mid+5; right=mid-5 if not col else page.width-55
         end=min([float(q["top"]) for q,_ in labs if int(float(q["x0"])>=mid)==col and float(q["top"])>top+5] or [page.height-90])
-        # 다음 개념 코너가 시작되면 현재 예제/유제는 그 직전에 끝나야 한다.
-        # 기존 코드는 다음 예제/유제만 종료점으로 사용해서, 사이에 있는
-        # <개념 N> 박스 전체가 문제 이미지에 붙는 경우가 있었다.
-        concept_tops=[
-            float(q["top"]) for q in ws
-            if float(q["top"])>top+5
-            and (norm(q["text"])=="개념" or re.fullmatch(r"개념\d+",norm(q["text"])))
-        ]
-        concept_limit=None
-        if concept_tops:
-            concept_limit=min(concept_tops)-5
-            end=min(end,concept_limit)
         if kind=="예제":
             stops=[float(q["top"]) for q in ws if left<=float(q["x0"])<right and top<float(q["top"])<end and norm(q["text"]).startswith("풀이")]
             # '풀이' 캡슐 배경은 글자보다 조금 위에서 시작하므로 충분히 앞에서 끊는다.
             if stops: end=min(stops)-10
         box=tight(page,left,right,top-3,end)
-        # 다음 개념 코너는 절대 현재 문제에 포함하지 않는다. 일부 PDF의 큰
-        # 배경 도형 bbox가 경계를 걸치면 tight()가 아래쪽까지 확장될 수 있어
-        # 개념 시작점을 하드 컷으로 한 번 더 적용한다.
-        if box is not None and concept_limit is not None:
-            box=(box[0],box[1],box[2],min(box[3],concept_limit))
         # 도형이 풀이 행보다 아래까지 내려오는 예제는 도형을 살리되 왼쪽 풀이 글자만 지운다.
         if kind=="예제" and stops and box is not None and box[3]>end:
             cleaned=image.copy()
@@ -159,124 +121,14 @@ def written(page,image,out,pno):
                 continue
             first=float(stages[0]["top"]); header_end=min([float(w["top"]) for w in stops if float(w["top"])<first] or [first])-3; hb=tight(page,left,right,m.top-3,header_end)
             if hb is None: continue
-            header=add_margin(trim_white(image.crop(pdf_box_to_pixels(page,image,hb)),10),24)
+            header=add_margin(image.crop(pdf_box_to_pixels(page,image,hb)),24)
             for si,stage in enumerate(stages):
                 top=float(stage["top"])-3; stop=float(stages[si+1]["top"])-5 if si+1<len(stages) else end
                 marks=[float(w["top"]) for w in stops if top<float(w["top"])<stop]
                 if marks: stop=min(marks)-2
                 sb=tight(page,left,right,top,stop)
                 if sb is None: continue
-                stage_img=add_margin(trim_white(image.crop(pdf_box_to_pixels(page,image,sb)),10),24); path=out/f"{pno:03d}p_{serial:03d}_{si+1}단계.png"; stack(header,stage_img).save(path,"PNG",optimize=True); result.append(path)
-    return result
-
-
-def _colored_row_runs(image: Image.Image, x0: int, x1: int):
-    """색상 문제번호/라벨이 있는 행 후보를 찾는다. OCR 없는 이미지 PDF용."""
-    arr=np.asarray(image.convert("RGB"))
-    r=arr[...,0].astype(np.int16); g=arr[...,1].astype(np.int16); b=arr[...,2].astype(np.int16)
-    mx=np.maximum.reduce([r,g,b]); mn=np.minimum.reduce([r,g,b])
-    colorful=(mx-mn>35)&(mx<250)&(mn<240)
-    # 개념완성의 파랑/청록/주황/분홍 계열 라벨을 폭넓게 허용한다.
-    chroma=((b-r>18)|(g-r>18)|(r-g>22))
-    mask=colorful&chroma
-    counts=mask[:,max(0,x0):min(image.width,x1)].sum(axis=1)
-    active=counts>=3
-    runs=[]; start=None
-    for y,on in enumerate(active):
-        if on and start is None:
-            start=y
-        if start is not None and (not on or y==len(active)-1):
-            end=y if not on else y+1
-            h=end-start; total=int(counts[start:end].sum())
-            if 10<=h<=32 and total>=90:
-                runs.append((start,end,total))
-            start=None
-    # 너무 가까운 색상 조각은 하나의 번호/라벨로 합친다.
-    merged=[]
-    for run in runs:
-        if merged and run[0]-merged[-1][1]<=5:
-            a=merged.pop()
-            merged.append((a[0],run[1],a[2]+run[2]))
-        else:
-            merged.append(run)
-    return merged
-
-def _image_content_box(image: Image.Image, left: int, right: int, top: int, bottom: int):
-    """이미지 픽셀 기준으로 실제 잉크가 있는 영역만 반환한다."""
-    left=max(0,int(left)); right=min(image.width,int(right))
-    top=max(0,int(top)); bottom=min(image.height,int(bottom))
-    if right<=left or bottom<=top:
-        return None
-    part=np.asarray(image.convert("RGB"))[top:bottom,left:right]
-    ink=np.any(part<247,axis=2)
-    ys,xs=np.where(ink)
-    if len(xs)==0:
-        return None
-    pad=12
-    return (max(0,left+int(xs.min())-pad),max(0,top+int(ys.min())-pad),
-            min(image.width,left+int(xs.max())+pad+1),min(image.height,top+int(ys.max())+pad+1))
-
-def image_fallback(page_image: Image.Image, output: Path, page_no: int) -> list[Path]:
-    """텍스트 레이어가 없는 스캔/이미지 PDF를 색상 번호 위치로 추출한다.
-
-    완전한 OCR 대신 개념완성의 공통 편집 규칙(두 단, 색상 문제번호/라벨)을
-    이용한다. 문제번호의 실제 숫자는 읽지 않고 페이지 내 순서대로 저장한다.
-    """
-    w,h=page_image.size
-    # 앞부속/단원 표지 등은 문제 페이지로 오인하지 않도록 보수적으로 제외.
-    if page_no<=8:
-        return []
-    mid=w//2
-    bands=[(int(w*.045),int(w*.22)),(mid+int(w*.015),min(w-1,mid+int(w*.34)))]
-    all_items=[]
-    # 오른쪽 약 2/3 지점에 긴 세로선이 있으면 '개념 확인하기'처럼
-    # 오른쪽이 참고 개념 사이드바인 1단 페이지다. 이때 사이드바는 문제로
-    # 추출하지 않는다.
-    gray=np.asarray(page_image.convert("L"))
-    vertical=(gray<225).sum(axis=0)
-    sidebar=[x for x in range(int(w*.58),int(w*.82)) if vertical[x]>h*.25]
-    if sidebar and page_no!=9:
-        cut=min(sidebar)
-        bands=[(int(w*.045),max(int(w*.18),cut-12))]
-
-    for col,(bx0,bx1) in enumerate(bands):
-        runs=_colored_row_runs(page_image,bx0,bx1)
-        # 상단 장식/페이지 제목은 제거한다.
-        runs=[r for r in runs if r[0]>int(h*.12)]
-        if page_no==9:
-            # 개념 학습 페이지에서는 위쪽의 <개념> 박스가 아니라 아래쪽
-            # 예제/유제 라벨 네 개만 추출한다.
-            runs=[r for r in runs if r[0]>int(h*.50)]
-        # 파트 제목처럼 폭이 큰 장식행은 대개 색상 픽셀량이 매우 크다.
-        # 문제번호는 상대적으로 작으므로 극단적인 후보만 제거한다.
-        runs=[r for r in runs if r[2] < max(1700,int((bx1-bx0)*18))]
-        for r in runs:
-            all_items.append((col,r))
-    if not all_items:
-        return []
-
-    result=[]; serial=0
-    for col in (0,1):
-        runs=sorted([r for c,r in all_items if c==col],key=lambda z:z[0])
-        if not runs:
-            continue
-        left=int(w*.045) if col==0 else mid+int(w*.015)
-        right=mid-int(w*.02) if col==0 else w-int(w*.045)
-        for i,(y0,y1,total) in enumerate(runs):
-            end=(runs[i+1][0]-8 if i+1<len(runs) else int(h*.92))
-            if end-y0 < 35:
-                continue
-            box=_image_content_box(page_image,left,right,y0-10,end)
-            if box is None:
-                continue
-            crop_img=trim_white(page_image.crop(box),10)
-            # 지나치게 작은 장식만 잡힌 후보는 버린다.
-            if crop_img.width<80 or crop_img.height<35:
-                continue
-            serial+=1
-            path=output/f"{page_no:03d}p_{serial:03d}_이미지PDF.png"
-            add_margin(crop_img,24).save(path,"PNG",optimize=True)
-            result.append(path)
+                stage_img=add_margin(image.crop(pdf_box_to_pixels(page,image,sb)),24); path=out/f"{pno:03d}p_{serial:03d}_{si+1}단계.png"; stack(header,stage_img).save(path,"PNG",optimize=True); result.append(path)
     return result
 
 def classify(page):
@@ -292,18 +144,10 @@ def extract(source:Path,output:Path,scale:float=3.0):
     output.mkdir(parents=True,exist_ok=True); renderer=pdfium.PdfDocument(str(source)); result=[]
     try:
         with pdfplumber.open(source) as doc:
-            image_only=not any((p.extract_text() or "").strip() for p in doc.pages[:min(6,len(doc.pages))])
             for i,page in enumerate(doc.pages):
-                if image_only:
-                    image=renderer[i].render(scale=scale).to_pil().convert("RGB")
-                    made=image_fallback(image,output,i+1)
-                    if made:
-                        result.extend(made)
-                        print(f"page {i + 1}: image-fallback, {len(made)} image(s)")
-                    continue
                 kind=classify(page)
                 if kind=="skip": continue
-                image=renderer[i].render(scale=scale).to_pil().convert("RGB"); fn={"examples":examples,"types":types,"written":written,"numbered":numbered}[kind]; made=fn(page,image,output,i+1); result.extend(made); print(f"page {i + 1}: {kind}, {len(made)} image(s)")
+                image=renderer[i].render(scale=scale).to_pil().convert("RGB"); fn={"examples":examples,"types":types,"written":written,"numbered":numbered}[kind]; made=fn(page,image,output,i+1); result.extend(made); print(f"page {i+1}: {kind}, {len(made)} image(s)")
     finally: renderer.close()
     return sorted(result)
 

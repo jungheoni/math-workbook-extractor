@@ -26,9 +26,10 @@ from PIL import Image
 
 PROFILES = {
     "pungsanja": {"digits": 3, "label": "풍산자"},
-    "최고난도": {"digits": 2, "label": "최고난도"},
+    # 구판은 색상 2자리, 신판은 회색 2자리+색상 1자리의 3자리 번호다.
+    "최고난도": {"digits": (3, 2), "label": "최고난도"},
     # 이전 실행 명령과 진행 기록을 위한 호환 별칭
-    "choegonado": {"digits": 2, "label": "최고난도"},
+    "choegonado": {"digits": (3, 2), "label": "최고난도"},
 }
 STOP_WORDS = ("풍산자曰", "풀이", "해설", "정답")
 SOLUTION_PATTERNS = (
@@ -107,7 +108,7 @@ def is_colored_text(value: object, saturation_threshold: float = 0.08) -> bool:
 
 
 def find_markers(page, digits: int = 3) -> list[Marker]:
-    number_re = re.compile(rf"\d{{{digits}}}")
+    number_re = re.compile(rf"[0-9]{{{digits}}}")
     words = page.extract_words(
         use_text_flow=True,
         x_tolerance=2,
@@ -130,17 +131,17 @@ def find_markers(page, digits: int = 3) -> list[Marker]:
     # Some publishers color each digit with a slightly different CMYK value.
     # pdfplumber then cannot expose the complete number as one uniformly
     # colored word, so also reconstruct markers directly from adjacent chars.
-    colored_digits = [
+    digit_chars = [
         char for char in page.chars
-        if str(char.get("text", "")).isdigit()
-        and is_colored_text(char.get("non_stroking_color"))
+        if re.fullmatch(r"[0-9]", str(char.get("text", "")))
     ]
-    colored_digits.sort(key=lambda char: (round(float(char["top"]), 1), float(char["x0"])))
+    digit_chars.sort(key=lambda char: (round(float(char["top"]), 1), float(char["x0"])))
     runs: list[list[dict]] = []
-    for char in colored_digits:
+    for char in digit_chars:
         if (
             not runs
             or abs(float(char["top"]) - float(runs[-1][-1]["top"])) > 2.0
+            or float(char["x0"]) < float(runs[-1][-1]["x0"])
             or float(char["x0"]) - float(runs[-1][-1]["x1"]) > 2.5
         ):
             runs.append([char])
@@ -149,6 +150,10 @@ def find_markers(page, digits: int = 3) -> list[Marker]:
 
     for run in runs:
         if len(run) != digits:
+            continue
+        # 최고난도 신판처럼 회색 숫자와 색상 숫자가 섞인 번호도 허용하되,
+        # 페이지 번호처럼 전부 무채색인 숫자는 제외한다.
+        if not any(is_colored_text(char.get("non_stroking_color")) for char in run):
             continue
         text = "".join(str(char["text"]) for char in run)
         candidate = Marker(
@@ -458,9 +463,26 @@ def extract(
     with pdfplumber.open(pdf_path) as document:
         for page_index, page in enumerate(document.pages):
             print(f"[page {page_index + 1}/{page_total}]")
-            markers, column_count, split_x = assign_columns(
-                find_markers(page, int(profile_settings["digits"])), page.width
-            )
+            digit_options = profile_settings["digits"]
+            if isinstance(digit_options, int):
+                digit_options = (digit_options,)
+            marker_candidates = [
+                marker
+                for digit_count in digit_options
+                for marker in find_markers(page, int(digit_count))
+            ]
+            # 001과 같은 3자리 번호 내부에서 01을 별도 문제로 중복 인식하지 않는다.
+            markers = [
+                marker for marker in marker_candidates
+                if not any(
+                    len(other.number) > len(marker.number)
+                    and abs(other.top - marker.top) <= 2.2
+                    and other.x0 - 2 <= marker.x0
+                    and marker.x1 <= other.x1 + 2
+                    for other in marker_candidates
+                )
+            ]
+            markers, column_count, split_x = assign_columns(markers, page.width)
             if not markers:
                 save_progress(False, page_index + 1)
                 continue

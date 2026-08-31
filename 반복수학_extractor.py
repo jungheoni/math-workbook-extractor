@@ -1,8 +1,8 @@
 """반복수학 교재 전용 문제 추출기.
 
-큰 색상 번호 아래의 (1), (2), ...를 각각 자른다. 첫 소문항에는
-큰 번호와 공통 발문을 포함하고, 나머지는 소문항부터 시작한다.
-①~⑤ 선택지가 있는 문제는 소문항으로 나누지 않고 큰 번호 기준으로 자른다.
+큰 색상 번호 하나를 기준으로 발문과 (1), (2), ... 소문항 전체를
+한 장으로 자른다. 중학·고등·반복 파워의 개념 기본 문제에도 동일하게
+적용하며, ①~⑤ 선택지가 있는 문제도 큰 번호 기준으로 유지한다.
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ def main_markers(page) -> list[MainMarker]:
         if (
             not runs
             or abs(float(char["top"]) - float(runs[-1][-1]["top"])) > 2
+            or float(char["x0"]) < float(runs[-1][-1]["x0"])
             or float(char["x0"]) - float(runs[-1][-1]["x1"]) > 3
         ):
             runs.append([char])
@@ -223,41 +224,21 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                         if marker_index + 1 < len(column_markers)
                         else page.height - 90
                     )
-                    subs = sub_markers(page, left, right, marker.bottom, hard_bottom)
-                    if has_circled_choices(page, left, right, marker.top, hard_bottom):
-                        subs = []
-                    bands = []
-                    repeated_header = None
-                    if concept_basic_page and subs:
-                        header_box = tight_box(page, left, right, marker.top - 3, subs[0].top - 4)
-                        if header_box is not None:
-                            repeated_header = add_margin(
-                                rendered.crop(pdf_box_to_pixels(page, rendered, header_box)), 24
-                            )
-                    if subs:
-                        for sub_index, sub in enumerate(subs):
-                            band_top = sub.top - 3 if repeated_header is not None else marker.top if sub_index == 0 else sub.top - 3
-                            band_bottom = subs[sub_index + 1].top - 5 if sub_index + 1 < len(subs) else hard_bottom
-                            bands.append((band_top, band_bottom, sub.number))
-                    else:
-                        bands.append((marker.top, hard_bottom, None))
-
-                    for band_top, band_bottom, sub_number in bands:
-                        box = tight_box(page, left, right, band_top, band_bottom)
-                        if box is None:
-                            continue
-                        page_serial += 1
-                        suffix = f"-{sub_number}" if sub_number else ""
-                        filename = f"{page_index + 1:03d}p_{page_serial:03d}{suffix}.png"
-                        image = rendered.crop(pdf_box_to_pixels(page, rendered, box))
-                        image = add_margin(image, 24)
-                        if repeated_header is not None and sub_number is not None:
-                            image = stack_left(repeated_header, image)
-                            image = clean_concept_basic_image(image)
-                        destination = output_dir / filename
-                        image.save(destination, "PNG", optimize=True)
-                        saved.append(destination)
-                        print(f"saved {filename}: main {marker.number}{suffix}")
+                    # 소문항 위치와 관계없이 다음 큰 번호 직전까지 한 번만 저장한다.
+                    # 원본 배치를 유지하므로 발문 반복/소문항 합성은 하지 않는다.
+                    box = tight_box(page, left, right, marker.top - 4, hard_bottom)
+                    if box is None:
+                        continue
+                    page_serial += 1
+                    filename = f"{page_index + 1:03d}p_{page_serial:03d}.png"
+                    image = rendered.crop(pdf_box_to_pixels(page, rendered, box))
+                    image = add_margin(image, 24)
+                    if concept_basic_page:
+                        image = clean_concept_basic_image(image)
+                    destination = output_dir / filename
+                    image.save(destination, "PNG", optimize=True)
+                    saved.append(destination)
+                    print(f"saved {filename}: main {marker.number}")
     renderer.close()
     return saved
 

@@ -20,6 +20,12 @@ from PIL import Image
 from pungsanja_extractor import add_margin, is_colored_text, pdf_box_to_pixels
 
 
+# 16:9 PPT의 좌상단 배치에서 20pt 상당 크기를 유지할 수 있는 최대 높이.
+# 외곽 여백(위아래 24px씩)을 포함한 값이다.
+MAX_IMAGE_HEIGHT = 760
+OUTPUT_MARGIN = 24
+
+
 @dataclass(frozen=True)
 class MainMarker:
     number: str
@@ -165,6 +171,65 @@ def stack_left(header: Image.Image, body: Image.Image) -> Image.Image:
     return result
 
 
+def stack_panels(panels: list[Image.Image], gap: int = 18) -> Image.Image:
+    """열을 넘어 이어지는 한 문제의 조각을 읽는 순서대로 세로 결합한다."""
+    if len(panels) == 1:
+        return panels[0]
+    width = max(panel.width for panel in panels)
+    height = sum(panel.height for panel in panels) + gap * (len(panels) - 1)
+    result = Image.new("RGB", (width, height), "white")
+    y = 0
+    for panel in panels:
+        result.paste(panel, (0, y))
+        y += panel.height + gap
+    return result
+
+
+def split_at_whitespace(image: Image.Image, max_height: int = MAX_IMAGE_HEIGHT) -> list[Image.Image]:
+    """20pt 크기를 유지하도록 긴 문제를 가로 공백에서 여러 이미지로 나눈다."""
+    rgb = image.convert("RGB")
+    if rgb.height <= max_height:
+        return [rgb]
+
+    # 기존 외곽 여백을 제거한 뒤 각 조각에 동일한 여백을 다시 준다.
+    margin = OUTPUT_MARGIN
+    inner = rgb.crop((margin, margin, rgb.width - margin, rgb.height - margin))
+    part_height = max_height - margin * 2
+    pixels = np.asarray(inner)
+    ink_per_row = np.count_nonzero(np.min(pixels, axis=2) < 245, axis=1)
+    parts = []
+    start = 0
+    while inner.height - start > part_height:
+        target = start + part_height
+        search_start = max(start + 120, target - 150)
+        # 가능한 한 목표 높이에 가까운 빈 행을 선택한다. 완전히 빈 행이
+        # 없으면 잉크가 가장 적은 행을 사용하되 수식/글자 중간은 피한다.
+        densities = ink_per_row[search_start:target + 1]
+        minimum = int(densities.min())
+        quiet_mask = densities <= max(minimum, max(2, inner.width // 300))
+        # 짧은 빈틈보다 소문항 사이의 넓은 공백을 우선한다. 그러면 다음
+        # 소문항 제목만 앞 페이지 끝에 남는 widow 현상을 막을 수 있다.
+        quiet_runs = []
+        run_start = None
+        for offset, quiet in enumerate(np.append(quiet_mask, False)):
+            if quiet and run_start is None:
+                run_start = offset
+            elif not quiet and run_start is not None:
+                quiet_runs.append((offset - run_start, run_start, offset - 1))
+                run_start = None
+        if quiet_runs:
+            _, run_begin, run_end = max(quiet_runs, key=lambda run: (run[0], run[2]))
+            cut = search_start + (run_begin + run_end) // 2
+        else:
+            cut = target
+        if cut <= start + 80:
+            cut = target
+        parts.append(add_margin(inner.crop((0, start, inner.width, cut)), margin))
+        start = cut
+    parts.append(add_margin(inner.crop((0, start, inner.width, inner.height)), margin))
+    return parts
+
+
 def clean_concept_basic_image(image: Image.Image) -> Image.Image:
     """개념 기본 문제의 연한 살구색 페이지 장식을 지우고 내용에 맞춰 재단한다."""
     pixels = np.asarray(image.convert("RGB")).copy()
@@ -214,10 +279,31 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                 and page.width * 0.4 < float(line["x0"]) < page.width * 0.6
             ]
             divider = float(divider_lines[0]["x0"]) if divider_lines else page.width / 2
+            markers_by_column = {
+                column: sorted((marker for marker in markers if marker.column == column), key=lambda marker: marker.top)
+                for column in (0, 1)
+            }
+            # 왼쪽 마지막 문제의 소문항이 오른쪽 단 상단으로 이어지는지 판별한다.
+            continuation_box = None
+            continuation_owner = None
+            left_markers = markers_by_column[0]
+            right_markers = markers_by_column[1]
+            if left_markers and right_markers:
+                exercise_top = min(marker.top for marker in markers)
+                first_right = right_markers[0]
+                right_left, right_right = divider + 4, page.width - 45
+                continuation_subs = sub_markers(
+                    page, right_left, right_right, exercise_top, first_right.top - 5
+                )
+                if continuation_subs and first_right.top - exercise_top > 80:
+                    continuation_box = tight_box(
+                        page, right_left, right_right, exercise_top, first_right.top - 5
+                    )
+                    continuation_owner = left_markers[-1]
             for column in (0, 1):
                 left = 45 if column == 0 else divider + 4
                 right = divider - 4 if column == 0 else page.width - 45
-                column_markers = sorted((marker for marker in markers if marker.column == column), key=lambda marker: marker.top)
+                column_markers = markers_by_column[column]
                 for marker_index, marker in enumerate(column_markers):
                     hard_bottom = (
                         column_markers[marker_index + 1].top - 5
@@ -229,16 +315,21 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                     box = tight_box(page, left, right, marker.top - 4, hard_bottom)
                     if box is None:
                         continue
-                    page_serial += 1
-                    filename = f"{page_index + 1:03d}p_{page_serial:03d}.png"
-                    image = rendered.crop(pdf_box_to_pixels(page, rendered, box))
-                    image = add_margin(image, 24)
+                    panels = [rendered.crop(pdf_box_to_pixels(page, rendered, box))]
+                    if marker == continuation_owner and continuation_box is not None:
+                        panels.append(rendered.crop(pdf_box_to_pixels(page, rendered, continuation_box)))
+                    image = add_margin(stack_panels(panels), OUTPUT_MARGIN)
                     if concept_basic_page:
                         image = clean_concept_basic_image(image)
-                    destination = output_dir / filename
-                    image.save(destination, "PNG", optimize=True)
-                    saved.append(destination)
-                    print(f"saved {filename}: main {marker.number}")
+                    page_serial += 1
+                    parts = split_at_whitespace(image)
+                    for part_index, part in enumerate(parts, 1):
+                        part_suffix = f"-{part_index:02d}" if len(parts) > 1 else ""
+                        filename = f"{page_index + 1:03d}p_{page_serial:03d}{part_suffix}.png"
+                        destination = output_dir / filename
+                        part.save(destination, "PNG", optimize=True)
+                        saved.append(destination)
+                        print(f"saved {filename}: main {marker.number}")
     renderer.close()
     return saved
 

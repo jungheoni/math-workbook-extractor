@@ -23,6 +23,8 @@ from pungsanja_extractor import add_margin, is_colored_text, pdf_box_to_pixels
 # 16:9 PPT의 좌상단 배치에서 20pt 상당 크기를 유지할 수 있는 최대 높이.
 # 외곽 여백(위아래 24px씩)을 포함한 값이다.
 MAX_IMAGE_HEIGHT = 760
+# (1), (2)처럼 번호가 붙은 소문항은 그림/풀이 박스를 한 장에 유지하는 것을 우선한다.
+SUBQUESTION_MAX_HEIGHT = 1200
 OUTPUT_MARGIN = 24
 CONTINUATION_GAP = 18
 
@@ -312,6 +314,28 @@ def prompt_header(
     return rendered.crop(pdf_box_to_pixels(page, rendered, box)).convert("RGB")
 
 
+def prompt_body_start(
+    page,
+    marker: MainMarker,
+    left: float,
+    right: float,
+    hard_bottom: float,
+) -> float | None:
+    """공통 발문 아래 첫 소문항/선택지의 시작 y좌표를 찾는다."""
+    boundaries = [
+        sub.top for sub in sub_markers(page, left, right, marker.bottom, hard_bottom)
+        if sub.top > marker.bottom + 2
+    ]
+    boundaries.extend(
+        float(char["top"])
+        for char in getattr(page, "chars", [])
+        if str(char.get("text", "")) in "①②③④⑤"
+        and left <= float(char["x0"]) < right
+        and marker.bottom + 2 < float(char["top"]) < hard_bottom
+    )
+    return min(boundaries) if boundaries else None
+
+
 def tight_box(page, left: float, right: float, top: float, bottom: float):
     horizontal_margin = 8.0
     vertical_margin = 4.0
@@ -355,8 +379,34 @@ def tight_box(page, left: float, right: float, top: float, bottom: float):
     )
 
 
+def trim_horizontal_whitespace(image: Image.Image, padding: int = 0) -> Image.Image:
+    """좌우의 순수 흰 여백만 제거한다.
+
+    분할 후 반복되는 공통 발문과 본문은 서로 다른 원본 crop 폭을 사용한다.
+    이 때문에 발문 자체에는 왼쪽 흰 여백이 남고, 오른쪽 단에서 이어진
+    소문항은 더 왼쪽에서 시작해 발문이 오른쪽으로 밀려 보일 수 있다.
+    두 이미지를 결합하기 전에 실제 잉크 시작점을 맞추기 위해 사용한다.
+    """
+    rgb = image.convert("RGB")
+    pixels = np.asarray(rgb)
+    ink = np.min(pixels, axis=2) < 245
+    cols = np.flatnonzero(np.any(ink, axis=0))
+    if len(cols) == 0:
+        return rgb.crop((0, 0, 1, rgb.height))
+    left = max(0, int(cols[0]) - padding)
+    right = min(rgb.width, int(cols[-1]) + padding + 1)
+    return rgb.crop((left, 0, right, rgb.height))
+
+
 def stack_left(header: Image.Image, body: Image.Image) -> Image.Image:
-    """공통 숫자 발문 아래에 소문항을 좌측 정렬로 결합한다."""
+    """공통 발문과 후속 소문항의 실제 내용 시작점을 좌측 정렬한다.
+
+    단순히 이미지 캔버스의 x=0에 붙이는 것이 아니라 두 이미지의 흰색
+    좌측 여백을 먼저 제거한다. 따라서 오른쪽 단에서 이어진 소문항처럼
+    body의 실제 시작점이 더 왼쪽인 경우에도 발문이 오른쪽으로 밀리지 않는다.
+    """
+    header = trim_horizontal_whitespace(header)
+    body = trim_horizontal_whitespace(body)
     width = max(header.width, body.width)
     result = Image.new(
         "RGB", (width, header.height + body.height + CONTINUATION_GAP), "white"
@@ -377,6 +427,41 @@ def stack_panels(panels: list[Image.Image], gap: int = 18) -> Image.Image:
     for panel in panels:
         result.paste(panel, (0, y))
         y += panel.height + gap
+    return result
+
+
+def _cut_crosses_vertical_border(
+    pixels: np.ndarray,
+    cut: int,
+    half_window: int = 24,
+) -> bool:
+    """박스의 좌우 세로 테두리 한가운데에서 자르는 것을 막는다."""
+    height = pixels.shape[0]
+    y0 = max(0, cut - half_window)
+    y1 = min(height, cut + half_window + 1)
+    if y1 - y0 < 12:
+        return False
+    ink = np.min(pixels[y0:y1], axis=2) < 225
+    # 같은 x열에 세로선이 창 높이의 대부분 존재하면 박스/표의 테두리로 본다.
+    vertical_counts = np.count_nonzero(ink, axis=0)
+    return bool(np.any(vertical_counts >= int((y1 - y0) * 0.78)))
+
+
+def _source_subquestion_boxes(
+    page,
+    left: float,
+    right: float,
+    top: float,
+    bottom: float,
+) -> list[tuple[str, tuple[float, float, float, float]]]:
+    """한 단 안의 (1), (2), ...를 각각 끊기지 않는 원본 영역으로 만든다."""
+    subs = sub_markers(page, left, right, top, bottom)
+    result = []
+    for index, sub in enumerate(subs):
+        end = subs[index + 1].top - 3 if index + 1 < len(subs) else bottom
+        box = tight_box(page, left, right, sub.top - 2, end)
+        if box is not None:
+            result.append((sub.number, box))
     return result
 
 
@@ -401,9 +486,13 @@ def split_at_whitespace(image: Image.Image, max_height: int = MAX_IMAGE_HEIGHT) 
         # 없으면 잉크가 가장 적은 행을 사용하되 수식/글자 중간은 피한다.
         densities = ink_per_row[search_start:target + 1]
         minimum = int(densities.min())
-        quiet_mask = densities <= max(minimum, max(2, inner.width // 300))
-        # 짧은 빈틈보다 소문항 사이의 넓은 공백을 우선한다. 그러면 다음
-        # 소문항 제목만 앞 페이지 끝에 남는 widow 현상을 막을 수 있다.
+        # 완전히 빈 행이 있으면 그것만 우선 사용한다. 박스의 좌우 세로선만
+        # 남은 행(잉크 1~2px)을 빈 공간으로 오인하면 박스 중앙이 잘린다.
+        if np.any(densities == 0):
+            quiet_mask = densities == 0
+        else:
+            quiet_mask = densities <= minimum
+
         quiet_runs = []
         run_start = None
         for offset, quiet in enumerate(np.append(quiet_mask, False)):
@@ -412,11 +501,28 @@ def split_at_whitespace(image: Image.Image, max_height: int = MAX_IMAGE_HEIGHT) 
             elif not quiet and run_start is not None:
                 quiet_runs.append((offset - run_start, run_start, offset - 1))
                 run_start = None
-        if quiet_runs:
-            _, run_begin, run_end = max(quiet_runs, key=lambda run: (run[0], run[2]))
-            cut = search_start + (run_begin + run_end) // 2
-        else:
-            cut = target
+
+        cut = None
+        # 넓고 목표점에 가까운 빈 구간부터 확인하되, 세로 박스 테두리를
+        # 가로지르는 위치는 후보에서 제외한다.
+        for _length, run_begin, run_end in sorted(
+            quiet_runs,
+            key=lambda run: (run[0], run[2]),
+            reverse=True,
+        ):
+            candidate = search_start + (run_begin + run_end) // 2
+            if not _cut_crosses_vertical_border(pixels, candidate):
+                cut = candidate
+                break
+
+        if cut is None:
+            # 최후 수단에서도 박스 테두리 중앙은 피한다.
+            candidates = list(range(target, search_start - 1, -1))
+            cut = next(
+                (candidate for candidate in candidates
+                 if not _cut_crosses_vertical_border(pixels, candidate)),
+                target,
+            )
         if cut <= start + 80:
             cut = target
         parts.append(add_margin(inner.crop((0, start, inner.width, cut)), margin))
@@ -522,23 +628,65 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                 column: sorted((marker for marker in markers if marker.column == column), key=lambda marker: marker.top)
                 for column in (0, 1)
             }
-            # 왼쪽 마지막 문제의 소문항이 오른쪽 단 상단으로 이어지는지 판별한다.
+            # 왼쪽 문제의 소문항이 오른쪽 단으로 이어지는지 판별한다.
+            #
+            # 기존 코드는 오른쪽 단에 '다음 큰 문제 번호'가 있을 때만 그 번호
+            # 위쪽을 continuation으로 보았다. 그래서 한 문제(예: 027)가 (1)~(4)는
+            # 왼쪽, (5)~(8)은 오른쪽에 배치되고 오른쪽 단에 별도 큰 번호/발문이
+            # 전혀 없는 페이지에서는 오른쪽 절반이 통째로 누락되었다.
             continuation_box = None
             continuation_owner = None
             left_markers = markers_by_column[0]
             right_markers = markers_by_column[1]
-            if left_markers and right_markers:
+            if left_markers:
                 exercise_top = min(marker.top for marker in markers)
-                first_right = right_markers[0]
                 right_left, right_right = divider + 4, page.width - 45
-                continuation_subs = sub_markers(
-                    page, right_left, right_right, exercise_top, first_right.top - 5
+
+                # 오른쪽에 다음 큰 문제가 있으면 그 직전까지만, 없으면 페이지
+                # 본문 하단까지 스캔한다. 후자가 '상단 발문 없는 2단 문제' 케이스다.
+                continuation_bottom = (
+                    right_markers[0].top - 5 if right_markers else page.height - 90
                 )
-                if continuation_subs and first_right.top - exercise_top > 80:
+                # 오른쪽 단에 큰 번호/공통 발문이 전혀 없는 판본은 첫 소문항이
+                # 왼쪽의 큰 번호보다 위에서 시작할 수도 있다. (예: 오른쪽 (5)가
+                # 왼쪽 027보다 약 30pt 위에 배치됨) 이 경우만 위쪽을 넉넉히
+                # 탐색한다.
+                continuation_scan_top = (
+                    exercise_top if right_markers else max(0, exercise_top - 90)
+                )
+                continuation_subs = sub_markers(
+                    page, right_left, right_right, continuation_scan_top, continuation_bottom
+                )
+
+                if continuation_subs and continuation_bottom - exercise_top > 80:
+                    first_sub_top = continuation_subs[0].top
+
+                    if right_markers:
+                        # 기존 판본의 읽기 순서를 유지한다. 오른쪽 첫 큰 번호보다
+                        # 위의 소문항은 왼쪽 단 마지막 큰 문제의 이어지는 부분이다.
+                        continuation_owner = left_markers[-1]
+                    else:
+                        # 오른쪽 단에 큰 번호가 하나도 없을 때는 첫 소문항의 세로
+                        # 위치와 가장 가까운 왼쪽 큰 문제를 소유자로 잡는다. 보통
+                        # 027처럼 페이지 전체를 양쪽 단으로 나눈 한 문제에 해당한다.
+                        preceding = [
+                            marker for marker in left_markers
+                            if marker.top <= first_sub_top + 12
+                        ]
+                        continuation_owner = (
+                            max(preceding, key=lambda marker: marker.top)
+                            if preceding else left_markers[0]
+                        )
+
+                    # 공통 발문이 없는 오른쪽 단에서는 실제 첫 소문항 바로 위부터
+                    # 잘라 불필요한 상단 공백까지 함께 붙는 것을 막는다.
                     continuation_box = tight_box(
-                        page, right_left, right_right, exercise_top, first_right.top - 5
+                        page,
+                        right_left,
+                        right_right,
+                        max(0, first_sub_top - 4),
+                        continuation_bottom,
                     )
-                    continuation_owner = left_markers[-1]
             for column in (0, 1):
                 left = 45 if column == 0 else divider + 4
                 right = divider - 4 if column == 0 else page.width - 45
@@ -555,24 +703,127 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                     if box is None:
                         continue
                     header = prompt_header(page, rendered, marker, left, right, hard_bottom)
-                    panel_boxes = [box]
-                    if marker == continuation_owner and continuation_box is not None:
-                        panel_boxes.append(continuation_box)
-                    panels = [
-                        trim_bottom_whitespace(remove_tip_bands(
-                            rendered.crop(pdf_box_to_pixels(page, rendered, panel_box)),
-                            page,
-                            rendered,
-                            panel_box,
-                            page_tip_regions,
-                        ))
-                        for panel_box in panel_boxes
-                    ]
-                    image = add_margin(stack_panels(panels), OUTPUT_MARGIN)
+                    body_start = prompt_body_start(page, marker, left, right, hard_bottom)
+
+                    # 공통 발문 + 소문항 구조는 발문과 본문을 별도로 재단한다.
+                    # 원본에서는 큰 번호 때문에 본문 (1), (2)...가 안쪽으로
+                    # 들어가 있는데, 분할 후 다른 단의 소문항과 합치면 그 들여쓰기가
+                    # 서로 달라 보일 수 있다. 각 본문 패널을 실제 잉크 시작점까지
+                    # 따로 당긴 뒤 같은 x=0 기준선에 맞춰 결합한다.
+                    if header is not None and body_start is not None:
+                        first_body_box = tight_box(
+                            page, left, right, body_start - 1, hard_bottom
+                        )
+                        body_boxes = [first_body_box] if first_body_box is not None else []
+                        if marker == continuation_owner and continuation_box is not None:
+                            body_boxes.append(continuation_box)
+
+                        body_panels = [
+                            trim_horizontal_whitespace(
+                                trim_bottom_whitespace(remove_tip_bands(
+                                    rendered.crop(pdf_box_to_pixels(page, rendered, panel_box)),
+                                    page,
+                                    rendered,
+                                    panel_box,
+                                    page_tip_regions,
+                                ))
+                            )
+                            for panel_box in body_boxes
+                        ]
+                        if body_panels:
+                            body = stack_panels(body_panels)
+                            image = add_margin(stack_left(header, body), OUTPUT_MARGIN)
+                        else:
+                            image = add_margin(
+                                rendered.crop(pdf_box_to_pixels(page, rendered, box)),
+                                OUTPUT_MARGIN,
+                            )
+                    else:
+                        panel_boxes = [box]
+                        if marker == continuation_owner and continuation_box is not None:
+                            panel_boxes.append(continuation_box)
+                        panels = [
+                            trim_bottom_whitespace(remove_tip_bands(
+                                rendered.crop(pdf_box_to_pixels(page, rendered, panel_box)),
+                                page,
+                                rendered,
+                                panel_box,
+                                page_tip_regions,
+                            ))
+                            for panel_box in panel_boxes
+                        ]
+                        image = add_margin(stack_panels(panels), OUTPUT_MARGIN)
                     if concept_basic_page:
                         image = clean_concept_basic_image(image)
+
                     page_serial += 1
-                    parts = split_with_repeated_header(image, header)
+
+                    # (1), (2), ... 소문항이 있으면 "소문항 하나 = 하나의 원자 단위"로
+                    # 처리한다. 전체 문제를 높이만 보고 자르면 그림이나 풀이 박스가
+                    # 중간에서 끊기는 문제가 생기기 때문이다.
+                    atomic_parts = []
+                    if header is not None and body_start is not None:
+                        atomic_boxes = _source_subquestion_boxes(
+                            page, left, right, body_start - 1, hard_bottom
+                        )
+
+                        # 왼쪽 문제의 소문항이 오른쪽 단으로 이어지는 경우도 같은
+                        # 방식으로 각각 원자 단위에 추가한다.
+                        if marker == continuation_owner and continuation_box is not None:
+                            right_left = divider + 4
+                            right_right = page.width - 45
+                            atomic_boxes.extend(
+                                _source_subquestion_boxes(
+                                    page,
+                                    right_left,
+                                    right_right,
+                                    continuation_box[1],
+                                    continuation_box[3],
+                                )
+                            )
+
+                        if len(atomic_boxes) >= 2:
+                            for _sub_no, atomic_box in atomic_boxes:
+                                body_piece = trim_horizontal_whitespace(
+                                    trim_bottom_whitespace(
+                                        remove_tip_bands(
+                                            rendered.crop(
+                                                pdf_box_to_pixels(
+                                                    page, rendered, atomic_box
+                                                )
+                                            ),
+                                            page,
+                                            rendered,
+                                            atomic_box,
+                                            page_tip_regions,
+                                        )
+                                    )
+                                )
+                                atomic_image = add_margin(
+                                    stack_left(header, body_piece), OUTPUT_MARGIN
+                                )
+                                if concept_basic_page:
+                                    atomic_image = clean_concept_basic_image(
+                                        atomic_image
+                                    )
+
+                                # 소문항은 1200px까지 한 장을 우선한다. 그보다 긴
+                                # 경우에만 분할하되, 위 split_at_whitespace가 박스의
+                                # 세로 테두리 내부를 자르지 않도록 보호한다.
+                                atomic_parts.extend(
+                                    split_with_repeated_header(
+                                        atomic_image,
+                                        header,
+                                        SUBQUESTION_MAX_HEIGHT,
+                                    )
+                                )
+
+                    parts = (
+                        atomic_parts
+                        if atomic_parts
+                        else split_with_repeated_header(image, header)
+                    )
+
                     for part_index, part in enumerate(parts, 1):
                         part_suffix = f"-{part_index:02d}" if len(parts) > 1 else ""
                         filename = f"{page_index + 1:03d}p_{page_serial:03d}{part_suffix}.png"

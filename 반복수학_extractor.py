@@ -168,6 +168,77 @@ def tip_regions(page) -> list[TipRegion]:
     return sorted(regions, key=lambda region: region.top)
 
 
+def point_regions(page) -> list[TipRegion]:
+    """``풍쌤 POINT`` 제목과 이어진 연한 파란 설명 상자를 찾는다."""
+    extract_words = getattr(page, "extract_words", lambda: [])
+    words = list(extract_words())
+    labels = [word for word in words if str(word.get("text", "")).strip() == "풍쌤"]
+    regions = []
+    for word in labels:
+        wx0, wtop, wx1, wbottom = map(
+            float, (word["x0"], word["top"], word["x1"], word["bottom"])
+        )
+        # 다른 본문에 우연히 등장한 '풍쌤'은 지우지 않는다. 같은 줄 바로
+        # 오른쪽에 POINT가 있는 전용 코너만 대상으로 삼는다.
+        has_point = any(
+            str(other.get("text", "")).strip().upper() == "POINT"
+            and 0 <= float(other["x0"]) - wx1 <= 18
+            and abs(float(other["top"]) - wtop) <= 4
+            for other in words
+        )
+        if not has_point:
+            continue
+
+        nearby = []
+        for curve in getattr(page, "curves", []):
+            if not all(key in curve for key in ("x0", "x1", "top", "bottom")):
+                continue
+            x0, top, x1, bottom = map(
+                float, (curve["x0"], curve["top"], curve["x1"], curve["bottom"])
+            )
+            if (
+                x0 <= wx1 + 8
+                and x1 >= wx0 - 8
+                and wtop - 15 <= top <= wbottom + 20
+                and bottom <= wbottom + 120
+                and x1 - x0 >= 20
+            ):
+                nearby.append((x0, top, x1, bottom))
+        if not nearby:
+            continue
+        background = max(
+            nearby, key=lambda item: (item[2] - item[0]) * (item[3] - item[1])
+        )
+        # 가장 큰 곡선이 본문 배경이고, 같은 코너의 작은 곡선들이 제목
+        # 탭을 구성한다. 둘을 합친 전체 세로 띠를 접어 빈 공간도 없앤다.
+        related = [
+            item for item in nearby
+            if item[0] <= background[2] and item[2] >= background[0]
+        ]
+        content_bottom = max(
+            (
+                float(other["bottom"])
+                for other in words
+                if background[0] - 5 <= float(other["x0"]) <= background[2] + 5
+                and wtop <= float(other["top"]) <= wtop + 160
+            ),
+            default=background[3],
+        )
+        regions.append(TipRegion(
+            min(item[0] for item in related) - 2,
+            # 제목 탭 왼쪽의 작은 삼각 장식은 별도 곡선이라 후보에서
+            # 빠질 수 있다. 제목 글자보다 20pt 위부터 지워 잔상을 막는다.
+            min(wtop - 20, min(item[1] for item in related) - 4),
+            max(item[2] for item in related) + 2,
+            max(max(item[3] for item in related) + 2, content_bottom + 8),
+        ))
+    deduped = {
+        (round(region.x0, 1), round(region.top, 1)): region
+        for region in regions
+    }
+    return sorted(deduped.values(), key=lambda region: region.top)
+
+
 def remove_tip_bands(
     image: Image.Image,
     page,
@@ -175,7 +246,7 @@ def remove_tip_bands(
     source_box,
     regions: list[TipRegion],
 ) -> Image.Image:
-    """TIP 상자가 차지한 가로 띠를 삭제해 빈 공간까지 함께 접는다."""
+    """TIP/풍쌤 POINT 상자가 차지한 가로 띠를 삭제해 함께 접는다."""
     result = image.convert("RGB")
     source_px = pdf_box_to_pixels(page, rendered, source_box)
     for region in sorted(regions, key=lambda item: item.top, reverse=True):
@@ -192,6 +263,18 @@ def remove_tip_bands(
         collapsed.paste(result.crop((0, y1, result.width, result.height)), (0, y0))
         result = collapsed
     return result
+
+
+def trim_bottom_whitespace(image: Image.Image, padding: int = 12) -> Image.Image:
+    """보조 상자를 지운 뒤 아래쪽에 남는 빈 공간만 정리한다."""
+    rgb = image.convert("RGB")
+    pixels = np.asarray(rgb)
+    ink = np.min(pixels, axis=2) < 245
+    rows = np.flatnonzero(np.any(ink, axis=1))
+    if len(rows) == 0:
+        return rgb.crop((0, 0, rgb.width, 1))
+    bottom = min(rgb.height, int(rows[-1]) + padding + 1)
+    return rgb.crop((0, 0, rgb.width, bottom))
 
 
 def prompt_header(
@@ -216,8 +299,11 @@ def prompt_header(
     )
     if not boundaries:
         return None
-    header_bottom = min(boundaries) - 3
-    if header_bottom <= marker.bottom + 4:
+    # 어떤 판본은 큰 번호/발문 바로 아래(약 4pt)에 첫 소문항이 붙는다.
+    # 소문항 위 1pt까지만 포함하면 발문 행은 온전히 남기면서 번호가
+    # 소문항에 섞이지 않는다.
+    header_bottom = min(boundaries) - 1
+    if header_bottom <= marker.bottom:
         return None
     box = tight_box(page, left, right, marker.top - 4, header_bottom)
     if box is None:
@@ -397,7 +483,7 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                 continue
             concept_basic_page = "개념기본문제" in re.sub(r"\s+", "", page.extract_text() or "")
             rendered = renderer[page_index].render(scale=scale).to_pil().convert("RGB")
-            page_tip_regions = tip_regions(page)
+            page_tip_regions = tip_regions(page) + point_regions(page)
             page_serial = 0
             divider_lines = [
                 line for line in page.lines
@@ -447,13 +533,13 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                     if marker == continuation_owner and continuation_box is not None:
                         panel_boxes.append(continuation_box)
                     panels = [
-                        remove_tip_bands(
+                        trim_bottom_whitespace(remove_tip_bands(
                             rendered.crop(pdf_box_to_pixels(page, rendered, panel_box)),
                             page,
                             rendered,
                             panel_box,
                             page_tip_regions,
-                        )
+                        ))
                         for panel_box in panel_boxes
                     ]
                     image = add_margin(stack_panels(panels), OUTPUT_MARGIN)

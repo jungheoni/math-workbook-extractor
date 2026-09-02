@@ -386,7 +386,9 @@ def prompt_header(
         visual,
         (visual_px[0] - combined_px[0], visual_px[1] - combined_px[1]),
     )
-    return trim_horizontal_whitespace(trim_vertical_whitespace(result))
+    return trim_horizontal_whitespace(
+        trim_vertical_whitespace(result, padding=8)
+    )
 
 
 def common_prompt_visual_box(
@@ -610,7 +612,11 @@ def pack_subquestions_with_header(
     max_height: int = MAX_IMAGE_HEIGHT,
     gap: int = 18,
 ) -> list[Image.Image]:
-    """소문항을 PPT 허용 높이까지 유동적으로 묶고 매 장 발문을 반복한다."""
+    """소문항을 고정 간격으로 묶고 PPT 높이를 넘을 때만 다음 장으로 넘긴다.
+
+    각 body는 이미 실제 내용 범위로 재단되어 있으므로 원본 PDF의 소문항 간
+    좌표 차이/빈 공간은 최종 이미지에 반영되지 않는다.
+    """
     if not bodies:
         return []
 
@@ -625,7 +631,12 @@ def pack_subquestions_with_header(
 
     normalized = []
     for body in bodies:
-        body = trim_vertical_whitespace(trim_horizontal_whitespace(body))
+        # 원본 PDF의 소문항 간 세로 좌표 차이는 버리고 실제 내용 범위만 사용한다.
+        # 위아래 8px 안전 여백을 남겨 글자/수식/박스 선이 잘리지 않게 한다.
+        body = trim_vertical_whitespace(
+            trim_horizontal_whitespace(body),
+            padding=8,
+        )
         if body.height <= available:
             normalized.append(body)
             continue
@@ -640,7 +651,7 @@ def pack_subquestions_with_header(
                 max(OUTPUT_MARGIN + 1, part.height - OUTPUT_MARGIN),
             ))
             if has_meaningful_ink(inner):
-                normalized.append(trim_vertical_whitespace(inner))
+                normalized.append(trim_vertical_whitespace(inner, padding=8))
 
     groups: list[list[Image.Image]] = []
     current: list[Image.Image] = []
@@ -687,14 +698,25 @@ def _source_subquestion_boxes(
     top: float,
     bottom: float,
 ) -> list[tuple[str, tuple[float, float, float, float]]]:
-    """한 단 안의 (1), (2), ...를 각각 끊기지 않는 원본 영역으로 만든다."""
+    """한 단 안의 (1), (2), ...를 각각 독립된 원자 영역으로 만든다.
+
+    원본 PDF에서 소문항 사이 간격이 제각각이어도 최종 배치에는 그 간격을
+    사용하지 않는다. 각 소문항은 실제 글자·수식·도형·보기·조건 박스의
+    외곽까지만 tight crop하고, 왼쪽은 소문항 번호를 기준으로 맞춘다.
+    """
     subs = sub_markers(page, left, right, top, bottom)
     result = []
     for index, sub in enumerate(subs):
         end = subs[index + 1].top - 3 if index + 1 < len(subs) else bottom
-        box = tight_box(page, left, right, sub.top - 2, end)
-        if box is not None:
-            result.append((sub.number, box))
+        box = tight_box(page, left, right, sub.top - 3, end)
+        if box is None:
+            continue
+
+        # 소문항 번호가 항상 동일한 x 기준선에서 시작하도록 왼쪽을 번호 기준으로 고정.
+        # 6pt 안전 여백을 남겨 괄호/획이 잘리지 않게 한다.
+        aligned_left = max(left, sub.x0 - 6)
+        box = (aligned_left, box[1], box[2], box[3])
+        result.append((sub.number, box))
     return result
 
 
@@ -1104,8 +1126,10 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                                     atomic_box,
                                     page_tip_regions,
                                 )
-                                body_piece = trim_horizontal_whitespace(
-                                    trim_bottom_whitespace(body_piece)
+                                body_piece = trim_horizontal_whitespace(body_piece)
+                                body_piece = trim_vertical_whitespace(
+                                    body_piece,
+                                    padding=8,
                                 )
                                 if has_meaningful_ink(body_piece):
                                     atomic_bodies.append(body_piece)

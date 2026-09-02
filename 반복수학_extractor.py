@@ -55,6 +55,33 @@ class TipRegion:
     bottom: float
 
 
+def _is_type_header_number(page, run: list[dict]) -> bool:
+    """'유형 07', '유형 10' 같은 유형 제목의 숫자인지 판별한다.
+
+    반복수학 파워에서는 유형 제목의 07, 08, 09, 10도 색상 큰 숫자라
+    실제 문제 번호와 같은 조건에 걸린다. 숫자 바로 왼쪽 같은 줄에
+    '유형'이 있으면 문제 시작 번호로 사용하지 않는다.
+    """
+    if not run:
+        return False
+
+    run_x0 = min(float(char["x0"]) for char in run)
+    run_top = min(float(char["top"]) for char in run)
+    run_bottom = max(float(char["bottom"]) for char in run)
+
+    # 같은 줄에서 숫자 왼쪽 70pt 이내의 텍스트를 모은다.
+    nearby = [
+        char for char in page.chars
+        if float(char["x1"]) <= run_x0 + 1
+        and run_x0 - 70 <= float(char["x0"]) <= run_x0
+        and abs(float(char["top"]) - run_top) <= 4
+        and abs(float(char["bottom"]) - run_bottom) <= 6
+    ]
+    nearby.sort(key=lambda char: float(char["x0"]))
+    left_text = "".join(str(char.get("text", "")) for char in nearby)
+    return "유형" in left_text
+
+
 def main_markers(page) -> list[MainMarker]:
     candidates = []
     for char in page.chars:
@@ -75,17 +102,21 @@ def main_markers(page) -> list[MainMarker]:
             runs.append([char])
         else:
             runs[-1].append(char)
-    return [
-        MainMarker(
-            "".join(str(char["text"]) for char in run),
-            min(float(char["x0"]) for char in run),
-            min(float(char["top"]) for char in run),
-            max(float(char["x1"]) for char in run),
-            max(float(char["bottom"]) for char in run),
-            int(sum(float(char["x0"]) for char in run) / len(run) >= page.width / 2),
+    markers = []
+    for run in runs:
+        if _is_type_header_number(page, run):
+            continue
+        markers.append(
+            MainMarker(
+                "".join(str(char["text"]) for char in run),
+                min(float(char["x0"]) for char in run),
+                min(float(char["top"]) for char in run),
+                max(float(char["x1"]) for char in run),
+                max(float(char["bottom"]) for char in run),
+                int(sum(float(char["x0"]) for char in run) / len(run) >= page.width / 2),
+            )
         )
-        for run in runs
-    ]
+    return markers
 
 
 def sub_markers(page, left: float, right: float, top: float, bottom: float) -> list[SubMarker]:
@@ -270,7 +301,7 @@ def remove_tip_bands(
 
 def trim_bottom_whitespace(image: Image.Image, padding: int = 12) -> Image.Image:
     """보조 상자를 지운 뒤 아래쪽에 남는 빈 공간만 정리한다."""
-    rgb = image.convert("RGB")
+    rgb = remove_left_color_sidebar(image).convert("RGB")
     pixels = np.asarray(rgb)
     ink = np.min(pixels, axis=2) < 245
     rows = np.flatnonzero(np.any(ink, axis=1))
@@ -377,6 +408,54 @@ def tight_box(page, left: float, right: float, top: float, bottom: float):
         min(right, max(item[2] for item in objects) + horizontal_margin),
         min(bottom, max(item[3] for item in objects) + vertical_margin),
     )
+
+
+def remove_left_color_sidebar(image: Image.Image) -> Image.Image:
+    """개념 기본 문제 왼쪽의 연두색 페이지 장식을 제거한다.
+
+    장식은 이미지 왼쪽 가장자리에 붙은 연한 민트/연두색 세로 띠 형태로
+    나타난다. 본문·문제번호와 겹치지 않는 왼쪽 영역만 흰색으로 지워서,
+    이후 trim_horizontal_whitespace()가 실제 문제번호부터 시작하도록 한다.
+    """
+    rgb = image.convert("RGB")
+    pixels = np.asarray(rgb).copy()
+
+    h, w = pixels.shape[:2]
+    if w < 40:
+        return rgb
+
+    # 왼쪽 28%까지만 검사. 본문까지 침범하지 않도록 제한한다.
+    scan_w = max(1, int(w * 0.28))
+    region = pixels[:, :scan_w]
+
+    r = region[..., 0].astype(np.int16)
+    g = region[..., 1].astype(np.int16)
+    b = region[..., 2].astype(np.int16)
+
+    # 샘플의 연두/민트 장식 범위.
+    mint = (
+        (r >= 205) & (r <= 245)
+        & (g >= 225) & (g <= 252)
+        & (b >= 215) & (b <= 248)
+        & (g >= r)
+        & (g - b <= 18)
+    )
+
+    # 각 열이 대부분 민트색이면 장식 열로 본다.
+    ratios = mint.mean(axis=0)
+    colored_cols = np.flatnonzero(ratios > 0.18)
+    if len(colored_cols) == 0:
+        return rgb
+
+    # 왼쪽에서 이어지는 장식 블록만 제거한다.
+    # 중간의 작은 컬러 요소를 잘못 지우지 않도록 최대 x를 제한.
+    cutoff = int(colored_cols.max()) + 1
+    cutoff = min(cutoff, scan_w)
+
+    # 장식 픽셀만 흰색 처리하고, 그 영역의 거의 빈 여백도 같이 제거될 수 있게 둔다.
+    pixels[:, :cutoff][mint[:, :cutoff]] = 255
+
+    return Image.fromarray(pixels, "RGB")
 
 
 def trim_horizontal_whitespace(image: Image.Image, padding: int = 0) -> Image.Image:
@@ -531,6 +610,65 @@ def split_at_whitespace(image: Image.Image, max_height: int = MAX_IMAGE_HEIGHT) 
     return parts
 
 
+def pack_subquestions_with_header(
+    header: Image.Image,
+    bodies: list[Image.Image],
+    max_height: int = MAX_IMAGE_HEIGHT,
+    oversize_height: int = SUBQUESTION_MAX_HEIGHT,
+) -> list[Image.Image]:
+    """소문항 단위를 깨지 않고 가능한 한 한 이미지에 많이 담는다.
+
+    원칙
+    ----
+    1) (1), (2), ... 각 소문항은 그림/풀이 박스까지 포함한 원자 단위다.
+    2) 여러 소문항이 MAX_IMAGE_HEIGHT 안에 들어가면 한 이미지에 함께 배치한다.
+    3) 다음 소문항을 추가하면 한도를 넘는 경우 다음 이미지로 넘긴다.
+    4) 소문항 하나 자체가 너무 길면 최대 oversize_height까지는 한 장을 허용한다.
+       그보다 긴 경우에만 안전한 공백 분할을 사용한다.
+    """
+    header = trim_horizontal_whitespace(header)
+    cleaned_bodies = [
+        trim_vertical_whitespace(trim_horizontal_whitespace(body))
+        for body in bodies
+        if has_meaningful_ink(body)
+    ]
+    if not cleaned_bodies:
+        return []
+
+    pages: list[Image.Image] = []
+    current: list[Image.Image] = []
+
+    def compose(parts: list[Image.Image]) -> Image.Image:
+        body = stack_panels(parts, gap=CONTINUATION_GAP)
+        return add_margin(stack_left(header, body), OUTPUT_MARGIN)
+
+    for body in cleaned_bodies:
+        # 소문항 하나 자체가 지나치게 길 때만 내부 분할 허용.
+        single = compose([body])
+        if single.height > oversize_height:
+            # 현재 페이지가 있으면 먼저 확정한다.
+            if current:
+                pages.append(compose(current))
+                current = []
+            split_single = split_with_repeated_header(
+                single, header, oversize_height
+            )
+            pages.extend(split_single)
+            continue
+
+        candidate = current + [body]
+        candidate_image = compose(candidate)
+        if current and candidate_image.height > max_height:
+            pages.append(compose(current))
+            current = [body]
+        else:
+            current = candidate
+
+    if current:
+        pages.append(compose(current))
+    return pages
+
+
 def split_with_repeated_header(
     image: Image.Image,
     header: Image.Image | None,
@@ -575,7 +713,8 @@ def trim_vertical_whitespace(image: Image.Image, padding: int = 0) -> Image.Imag
 
 
 def clean_concept_basic_image(image: Image.Image) -> Image.Image:
-    """개념 기본 문제의 연한 살구색 페이지 장식을 지우고 내용에 맞춰 재단한다."""
+    """개념 기본 문제의 페이지 장식을 지우고 내용에 맞춰 재단한다."""
+    image = remove_left_color_sidebar(image)
     pixels = np.asarray(image.convert("RGB")).copy()
     red = pixels[..., 0].astype(np.int16)
     green = pixels[..., 1].astype(np.int16)
@@ -758,17 +897,16 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
 
                     page_serial += 1
 
-                    # (1), (2), ... 소문항이 있으면 "소문항 하나 = 하나의 원자 단위"로
-                    # 처리한다. 전체 문제를 높이만 보고 자르면 그림이나 풀이 박스가
-                    # 중간에서 끊기는 문제가 생기기 때문이다.
-                    atomic_parts = []
+                    # (1), (2), ... 소문항은 그림/풀이 박스를 포함한 "원자 단위"로
+                    # 잡되, 각각 한 장씩 저장하지 않는다. PPT 가독성을 위해 가능한
+                    # 한 여러 소문항을 한 이미지에 묶고, 공간이 부족할 때만 다음
+                    # 이미지로 넘긴다.
+                    packed_parts = []
                     if header is not None and body_start is not None:
                         atomic_boxes = _source_subquestion_boxes(
                             page, left, right, body_start - 1, hard_bottom
                         )
 
-                        # 왼쪽 문제의 소문항이 오른쪽 단으로 이어지는 경우도 같은
-                        # 방식으로 각각 원자 단위에 추가한다.
                         if marker == continuation_owner and continuation_box is not None:
                             right_left = divider + 4
                             right_right = page.width - 45
@@ -782,7 +920,8 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                                 )
                             )
 
-                        if len(atomic_boxes) >= 2:
+                        if atomic_boxes:
+                            atomic_bodies = []
                             for _sub_no, atomic_box in atomic_boxes:
                                 body_piece = trim_horizontal_whitespace(
                                     trim_bottom_whitespace(
@@ -799,28 +938,25 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                                         )
                                     )
                                 )
-                                atomic_image = add_margin(
-                                    stack_left(header, body_piece), OUTPUT_MARGIN
+                                if has_meaningful_ink(body_piece):
+                                    atomic_bodies.append(body_piece)
+
+                            if atomic_bodies:
+                                packed_parts = pack_subquestions_with_header(
+                                    header,
+                                    atomic_bodies,
+                                    MAX_IMAGE_HEIGHT,
+                                    SUBQUESTION_MAX_HEIGHT,
                                 )
                                 if concept_basic_page:
-                                    atomic_image = clean_concept_basic_image(
-                                        atomic_image
-                                    )
-
-                                # 소문항은 1200px까지 한 장을 우선한다. 그보다 긴
-                                # 경우에만 분할하되, 위 split_at_whitespace가 박스의
-                                # 세로 테두리 내부를 자르지 않도록 보호한다.
-                                atomic_parts.extend(
-                                    split_with_repeated_header(
-                                        atomic_image,
-                                        header,
-                                        SUBQUESTION_MAX_HEIGHT,
-                                    )
-                                )
+                                    packed_parts = [
+                                        clean_concept_basic_image(part)
+                                        for part in packed_parts
+                                    ]
 
                     parts = (
-                        atomic_parts
-                        if atomic_parts
+                        packed_parts
+                        if packed_parts
                         else split_with_repeated_header(image, header)
                     )
 

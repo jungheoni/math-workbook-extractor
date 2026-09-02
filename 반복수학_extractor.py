@@ -24,6 +24,7 @@ from pungsanja_extractor import add_margin, is_colored_text, pdf_box_to_pixels
 # 외곽 여백(위아래 24px씩)을 포함한 값이다.
 MAX_IMAGE_HEIGHT = 760
 OUTPUT_MARGIN = 24
+CONTINUATION_GAP = 18
 
 
 @dataclass(frozen=True)
@@ -357,9 +358,11 @@ def tight_box(page, left: float, right: float, top: float, bottom: float):
 def stack_left(header: Image.Image, body: Image.Image) -> Image.Image:
     """공통 숫자 발문 아래에 소문항을 좌측 정렬로 결합한다."""
     width = max(header.width, body.width)
-    result = Image.new("RGB", (width, header.height + body.height + 18), "white")
+    result = Image.new(
+        "RGB", (width, header.height + body.height + CONTINUATION_GAP), "white"
+    )
     result.paste(header, (0, 0))
-    result.paste(body, (0, header.height + 18))
+    result.paste(body, (0, header.height + CONTINUATION_GAP))
     return result
 
 
@@ -430,16 +433,39 @@ def split_with_repeated_header(
     """긴 문제를 나누고 두 번째 조각부터 큰 번호·공통 발문을 다시 붙인다."""
     if image.height <= max_height or header is None:
         return split_at_whitespace(image, max_height)
-    reserve = header.height + 18
+    reserve = header.height + CONTINUATION_GAP
     reduced_height = max(260, max_height - reserve)
-    parts = split_at_whitespace(image, reduced_height)
+    parts = [
+        part for part in split_at_whitespace(image, reduced_height)
+        if has_meaningful_ink(part)
+    ]
     if len(parts) <= 1:
         return parts
     repeated = [parts[0]]
     for part in parts[1:]:
         body = part.crop((OUTPUT_MARGIN, OUTPUT_MARGIN, part.width - OUTPUT_MARGIN, part.height - OUTPUT_MARGIN))
+        body = trim_vertical_whitespace(body)
         repeated.append(add_margin(stack_left(header, body), OUTPUT_MARGIN))
     return repeated
+
+
+def has_meaningful_ink(image: Image.Image, minimum_pixels: int = 100) -> bool:
+    """긴 공백만 잘려 생긴 빈 조각인지 판별한다."""
+    pixels = np.asarray(image.convert("RGB"))
+    return int(np.count_nonzero(np.min(pixels, axis=2) < 245)) >= minimum_pixels
+
+
+def trim_vertical_whitespace(image: Image.Image, padding: int = 0) -> Image.Image:
+    """후속 조각의 바깥쪽 세로 공백을 없애 본문 시작 위치를 고정한다."""
+    rgb = image.convert("RGB")
+    pixels = np.asarray(rgb)
+    ink = np.min(pixels, axis=2) < 245
+    rows = np.flatnonzero(np.any(ink, axis=1))
+    if len(rows) == 0:
+        return rgb.crop((0, 0, rgb.width, 1))
+    top = max(0, int(rows[0]) - padding)
+    bottom = min(rgb.height, int(rows[-1]) + padding + 1)
+    return rgb.crop((0, top, rgb.width, bottom))
 
 
 def clean_concept_basic_image(image: Image.Image) -> Image.Image:

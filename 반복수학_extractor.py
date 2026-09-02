@@ -325,7 +325,13 @@ def prompt_header(
     right: float,
     hard_bottom: float,
 ) -> Image.Image | None:
-    """분할 이미지마다 반복할 큰 번호와 공통 발문을 추출한다."""
+    """분할 이미지마다 반복할 큰 번호·공통 발문·공통 도형을 추출한다.
+
+    발문 오른쪽의 도형은 첫 소문항보다 아래까지 내려오는 경우가 있다. 이때
+    첫 소문항 y좌표만으로 머리 영역을 자르면 도형이 잘린다. 소문항 경계를
+    가로지르는 오른쪽 그래픽은 별도 영역으로 보존하고, 그 아래의 소문항
+    텍스트는 머리 이미지에서 제외한다.
+    """
     boundaries = [
         sub.top for sub in sub_markers(page, left, right, marker.bottom, hard_bottom)
         if sub.top > marker.bottom + 2
@@ -339,16 +345,125 @@ def prompt_header(
     )
     if not boundaries:
         return None
-    # 어떤 판본은 큰 번호/발문 바로 아래(약 4pt)에 첫 소문항이 붙는다.
-    # 소문항 위 1pt까지만 포함하면 발문 행은 온전히 남기면서 번호가
-    # 소문항에 섞이지 않는다.
-    header_bottom = min(boundaries) - 1
+    # 수식의 윗줄과 빈칸 테두리는 (1) 글자의 top보다 1~2pt 위에서
+    # 시작할 수 있다. 3pt 안전 간격을 둬 첫 소문항 수식이 발문 머리에
+    # 섞이는 것을 막되, 발문과 (1)이 매우 가까운 판본도 유지한다.
+    header_bottom = min(boundaries) - 3
     if header_bottom <= marker.bottom:
         return None
-    box = tight_box(page, left, right, marker.top - 4, header_bottom)
-    if box is None:
+    base_box = tight_box(page, left, right, marker.top - 4, header_bottom)
+    if base_box is None:
         return None
-    return rendered.crop(pdf_box_to_pixels(page, rendered, box)).convert("RGB")
+    visual_box = common_prompt_visual_box(
+        page,
+        left,
+        right,
+        marker.top - 4,
+        min(boundaries),
+        sorted(boundaries)[1] - 3 if len(boundaries) > 1 else hard_bottom,
+    )
+    if visual_box is None:
+        return rendered.crop(
+            pdf_box_to_pixels(page, rendered, base_box)
+        ).convert("RGB")
+
+    combined_box = (
+        min(base_box[0], visual_box[0]),
+        min(base_box[1], visual_box[1]),
+        max(base_box[2], visual_box[2]),
+        max(base_box[3], visual_box[3]),
+    )
+    combined_px = pdf_box_to_pixels(page, rendered, combined_box)
+    base_px = pdf_box_to_pixels(page, rendered, base_box)
+    visual_px = pdf_box_to_pixels(page, rendered, visual_box)
+    result = rendered.crop(combined_px).convert("RGB")
+
+    # 첫 소문항 높이 아래의 본문은 지우고 공통 도형만 다시 붙인다.
+    base_bottom = max(0, min(result.height, base_px[3] - combined_px[1]))
+    result.paste("white", (0, base_bottom, result.width, result.height))
+    visual = rendered.crop(visual_px).convert("RGB")
+    result.paste(
+        visual,
+        (visual_px[0] - combined_px[0], visual_px[1] - combined_px[1]),
+    )
+    return trim_horizontal_whitespace(trim_vertical_whitespace(result))
+
+
+def common_prompt_visual_box(
+    page,
+    left: float,
+    right: float,
+    header_top: float,
+    first_body_top: float,
+    maximum_bottom: float,
+) -> tuple[float, float, float, float] | None:
+    """첫 소문항 경계를 넘는 발문 오른쪽 공통 도형의 영역을 찾는다."""
+    width = right - left
+    right_zone = left + width * 0.38
+    objects = []
+    for collection_name in ("lines", "rects", "curves", "images"):
+        for obj in getattr(page, collection_name, []):
+            if not all(key in obj for key in ("x0", "x1", "top", "bottom")):
+                continue
+            box = tuple(map(float, (obj["x0"], obj["top"], obj["x1"], obj["bottom"])))
+            x0, y0, x1, y1 = box
+            object_width, object_height = x1 - x0, y1 - y0
+            if x1 <= left or x0 >= right or y1 <= header_top or y0 >= maximum_bottom:
+                continue
+            if object_width > width * 0.88 and object_height < 4:
+                continue
+            if object_height > (maximum_bottom - header_top) * 0.85 and object_width < 4:
+                continue
+            objects.append(box)
+
+    # 경계를 실제로 가로지르는 오른쪽 그래픽이 있을 때만 확장한다.
+    cluster = [
+        box for box in objects
+        if box[2] > right_zone
+        # 첫 소문항 행의 빈칸/답안 박스는 경계와 맞닿아 있지만 공통
+        # 도형이 아니다. 도형은 반드시 소문항보다 충분히 위에서 시작해
+        # 경계를 가로지르는 경우에만 머리 영역으로 승격한다.
+        and box[1] <= first_body_top - 8
+        and box[3] > first_body_top + 2
+    ]
+    if not cluster:
+        return None
+
+    def near(a, b, gap: float = 14.0) -> bool:
+        return not (
+            a[2] + gap < b[0] or b[2] + gap < a[0]
+            or a[3] + gap < b[1] or b[3] + gap < a[1]
+        )
+
+    changed = True
+    while changed:
+        changed = False
+        for box in objects:
+            if box in cluster:
+                continue
+            if box[2] > right_zone and any(near(box, member) for member in cluster):
+                cluster.append(box)
+                changed = True
+
+    padding = 10.0
+    x0 = max(left, min(box[0] for box in cluster) - padding)
+    y0 = max(header_top, min(box[1] for box in cluster) - padding)
+    x1 = min(right, max(box[2] for box in cluster) + padding)
+    y1 = min(maximum_bottom, max(box[3] for box in cluster) + padding)
+
+    # 도형 주변의 A, B, C 같은 문자 표기도 함께 보존한다.
+    nearby_chars = []
+    for char in getattr(page, "chars", []):
+        cx = (float(char["x0"]) + float(char["x1"])) / 2
+        cy = (float(char["top"]) + float(char["bottom"])) / 2
+        if x0 - 8 <= cx <= x1 + 8 and y0 - 8 <= cy <= y1 + 8:
+            nearby_chars.append(char)
+    if nearby_chars:
+        x0 = max(left, min(x0, min(float(char["x0"]) for char in nearby_chars) - 4))
+        y0 = max(header_top, min(y0, min(float(char["top"]) for char in nearby_chars) - 4))
+        x1 = min(right, max(x1, max(float(char["x1"]) for char in nearby_chars) + 4))
+        y1 = min(maximum_bottom, max(y1, max(float(char["bottom"]) for char in nearby_chars) + 4))
+    return x0, y0, x1, y1
 
 
 def prompt_body_start(
@@ -435,6 +550,28 @@ def trim_horizontal_whitespace(image: Image.Image, padding: int = 0) -> Image.Im
     return rgb.crop((left, 0, right, rgb.height))
 
 
+def blank_pdf_region(
+    image: Image.Image,
+    page,
+    rendered: Image.Image,
+    source_box: tuple[float, float, float, float],
+    region_box: tuple[float, float, float, float] | None,
+) -> Image.Image:
+    """원본 좌표의 공통 도형을 소문항 crop에서 흰색으로 지운다."""
+    if region_box is None:
+        return image.convert("RGB")
+    source_px = pdf_box_to_pixels(page, rendered, source_box)
+    region_px = pdf_box_to_pixels(page, rendered, region_box)
+    x0 = max(0, region_px[0] - source_px[0])
+    y0 = max(0, region_px[1] - source_px[1])
+    x1 = min(image.width, region_px[2] - source_px[0])
+    y1 = min(image.height, region_px[3] - source_px[1])
+    result = image.convert("RGB")
+    if x1 > x0 and y1 > y0:
+        result.paste("white", (x0, y0, x1, y1))
+    return result
+
+
 def stack_left(header: Image.Image, body: Image.Image) -> Image.Image:
     """공통 발문과 후속 소문항의 실제 내용 시작점을 좌측 정렬한다.
 
@@ -465,6 +602,65 @@ def stack_panels(panels: list[Image.Image], gap: int = 18) -> Image.Image:
         result.paste(panel, (0, y))
         y += panel.height + gap
     return result
+
+
+def pack_subquestions_with_header(
+    header: Image.Image,
+    bodies: list[Image.Image],
+    max_height: int = MAX_IMAGE_HEIGHT,
+    gap: int = 18,
+) -> list[Image.Image]:
+    """소문항을 PPT 허용 높이까지 유동적으로 묶고 매 장 발문을 반복한다."""
+    if not bodies:
+        return []
+
+    available = max_height - OUTPUT_MARGIN * 2 - header.height - CONTINUATION_GAP
+    if available < 120:
+        # 머리 자체가 비정상적으로 큰 경우에도 안전하게 기존 분할기로 넘긴다.
+        return split_with_repeated_header(
+            add_margin(stack_left(header, stack_panels(bodies, gap)), OUTPUT_MARGIN),
+            header,
+            max_height,
+        )
+
+    normalized = []
+    for body in bodies:
+        body = trim_vertical_whitespace(trim_horizontal_whitespace(body))
+        if body.height <= available:
+            normalized.append(body)
+            continue
+
+        # 하나의 소문항만으로도 슬라이드를 넘을 때만 내부 빈 행에서 나눈다.
+        wrapped = add_margin(body, OUTPUT_MARGIN)
+        for part in split_at_whitespace(wrapped, available + OUTPUT_MARGIN * 2):
+            inner = part.crop((
+                OUTPUT_MARGIN,
+                OUTPUT_MARGIN,
+                max(OUTPUT_MARGIN + 1, part.width - OUTPUT_MARGIN),
+                max(OUTPUT_MARGIN + 1, part.height - OUTPUT_MARGIN),
+            ))
+            if has_meaningful_ink(inner):
+                normalized.append(trim_vertical_whitespace(inner))
+
+    groups: list[list[Image.Image]] = []
+    current: list[Image.Image] = []
+    current_height = 0
+    for body in normalized:
+        proposed = current_height + (gap if current else 0) + body.height
+        if current and proposed > available:
+            groups.append(current)
+            current = [body]
+            current_height = body.height
+        else:
+            current.append(body)
+            current_height = proposed
+    if current:
+        groups.append(current)
+
+    return [
+        add_margin(stack_left(header, stack_panels(group, gap)), OUTPUT_MARGIN)
+        for group in groups
+    ]
 
 
 def _cut_crosses_vertical_border(
@@ -781,6 +977,23 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                         continue
                     header = prompt_header(page, rendered, marker, left, right, hard_bottom)
                     body_start = prompt_body_start(page, marker, left, right, hard_bottom)
+                    marker_subs = sub_markers(
+                        page, left, right, marker.bottom, hard_bottom
+                    )
+                    common_visual = None
+                    if body_start is not None:
+                        later_tops = sorted(
+                            sub.top for sub in marker_subs
+                            if sub.top > body_start + 2
+                        )
+                        common_visual = common_prompt_visual_box(
+                            page,
+                            left,
+                            right,
+                            marker.top - 4,
+                            body_start,
+                            later_tops[0] - 3 if later_tops else hard_bottom,
+                        )
 
                     # 공통 발문 + 소문항 구조는 발문과 본문을 별도로 재단한다.
                     # 원본에서는 큰 번호 때문에 본문 (1), (2)...가 안쪽으로
@@ -795,18 +1008,30 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                         if marker == continuation_owner and continuation_box is not None:
                             body_boxes.append(continuation_box)
 
-                        body_panels = [
-                            trim_horizontal_whitespace(
-                                trim_bottom_whitespace(remove_tip_bands(
-                                    rendered.crop(pdf_box_to_pixels(page, rendered, panel_box)),
-                                    page,
-                                    rendered,
-                                    panel_box,
-                                    page_tip_regions,
-                                ))
+                        body_panels = []
+                        for panel_box in body_boxes:
+                            panel = rendered.crop(
+                                pdf_box_to_pixels(page, rendered, panel_box)
                             )
-                            for panel_box in body_boxes
-                        ]
+                            panel = blank_pdf_region(
+                                panel,
+                                page,
+                                rendered,
+                                panel_box,
+                                common_visual,
+                            )
+                            panel = remove_tip_bands(
+                                panel,
+                                page,
+                                rendered,
+                                panel_box,
+                                page_tip_regions,
+                            )
+                            body_panels.append(
+                                trim_horizontal_whitespace(
+                                    trim_bottom_whitespace(panel)
+                                )
+                            )
                         if body_panels:
                             body = stack_panels(body_panels)
                             image = add_margin(stack_left(header, body), OUTPUT_MARGIN)
@@ -860,40 +1085,45 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                             )
 
                         if len(atomic_boxes) >= 2:
+                            atomic_bodies = []
                             for _sub_no, atomic_box in atomic_boxes:
-                                body_piece = trim_horizontal_whitespace(
-                                    trim_bottom_whitespace(
-                                        remove_tip_bands(
-                                            rendered.crop(
-                                                pdf_box_to_pixels(
-                                                    page, rendered, atomic_box
-                                                )
-                                            ),
-                                            page,
-                                            rendered,
-                                            atomic_box,
-                                            page_tip_regions,
-                                        )
-                                    )
+                                body_piece = rendered.crop(
+                                    pdf_box_to_pixels(page, rendered, atomic_box)
                                 )
-                                atomic_image = add_margin(
-                                    stack_left(header, body_piece), OUTPUT_MARGIN
+                                body_piece = blank_pdf_region(
+                                    body_piece,
+                                    page,
+                                    rendered,
+                                    atomic_box,
+                                    common_visual,
+                                )
+                                body_piece = remove_tip_bands(
+                                    body_piece,
+                                    page,
+                                    rendered,
+                                    atomic_box,
+                                    page_tip_regions,
+                                )
+                                body_piece = trim_horizontal_whitespace(
+                                    trim_bottom_whitespace(body_piece)
+                                )
+                                if has_meaningful_ink(body_piece):
+                                    atomic_bodies.append(body_piece)
+
+                            # 소문항은 각각 보호하되 한 장에 하나씩 고정하지 않는다.
+                            # 20pt 크기를 유지하는 슬라이드 높이까지 여러 개를 묶고,
+                            # 넘치는 시점에만 다음 이미지로 보내 발문을 반복한다.
+                            if atomic_bodies:
+                                atomic_parts = pack_subquestions_with_header(
+                                    header,
+                                    atomic_bodies,
+                                    MAX_IMAGE_HEIGHT,
                                 )
                                 if concept_basic_page:
-                                    atomic_image = clean_concept_basic_image(
-                                        atomic_image
-                                    )
-
-                                # 소문항은 1200px까지 한 장을 우선한다. 그보다 긴
-                                # 경우에만 분할하되, 위 split_at_whitespace가 박스의
-                                # 세로 테두리 내부를 자르지 않도록 보호한다.
-                                atomic_parts.extend(
-                                    split_with_repeated_header(
-                                        atomic_image,
-                                        header,
-                                        SUBQUESTION_MAX_HEIGHT,
-                                    )
-                                )
+                                    atomic_parts = [
+                                        clean_concept_basic_image(part)
+                                        for part in atomic_parts
+                                    ]
 
                     parts = (
                         atomic_parts

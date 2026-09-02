@@ -44,6 +44,14 @@ class SubMarker:
     bottom: float
 
 
+@dataclass(frozen=True)
+class TipRegion:
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+
+
 def main_markers(page) -> list[MainMarker]:
     candidates = []
     for char in page.chars:
@@ -117,6 +125,104 @@ def has_circled_choices(page, left: float, right: float, top: float, bottom: flo
         and top <= float(char["top"]) < bottom
         for char in page.chars
     )
+
+
+def tip_regions(page) -> list[TipRegion]:
+    """PDF의 청록색 ``tip`` 표식과 연노랑 설명 상자를 한 영역으로 찾는다."""
+    extract_words = getattr(page, "extract_words", lambda: [])
+    words = [word for word in extract_words() if str(word.get("text", "")).lower() == "tip"]
+    regions = []
+    for word in words:
+        wx0, wtop, wx1, wbottom = map(
+            float, (word["x0"], word["top"], word["x1"], word["bottom"])
+        )
+        backgrounds = []
+        nearby_curves = []
+        for curve in getattr(page, "curves", []):
+            if not all(key in curve for key in ("x0", "x1", "top", "bottom")):
+                continue
+            x0, top, x1, bottom = map(
+                float, (curve["x0"], curve["top"], curve["x1"], curve["bottom"])
+            )
+            if x0 <= wx1 + 8 and x1 >= wx0 - 8 and top <= wbottom + 10 and bottom >= wtop - 10:
+                nearby_curves.append((x0, top, x1, bottom))
+            color = curve.get("non_stroking_color")
+            if not isinstance(color, (tuple, list)) or len(color) != 3:
+                continue
+            red, green, blue = map(float, color)
+            is_tip_yellow = red > 0.88 and green > 0.88 and 0.60 < blue < 0.88
+            if not is_tip_yellow:
+                continue
+            if x0 <= wx1 + 8 and x1 >= wx0 - 8 and top <= wbottom + 10 and bottom >= wtop - 2:
+                backgrounds.append((x0, top, x1, bottom))
+        if not backgrounds:
+            continue
+        background = max(backgrounds, key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))
+        marker_top = min((item[1] for item in nearby_curves), default=wtop)
+        regions.append(TipRegion(
+            min(wx0 - 6, background[0]) - 2,
+            min(wtop, marker_top, background[1]) - 2,
+            background[2] + 2,
+            background[3] + 2,
+        ))
+    return sorted(regions, key=lambda region: region.top)
+
+
+def remove_tip_bands(
+    image: Image.Image,
+    page,
+    rendered: Image.Image,
+    source_box,
+    regions: list[TipRegion],
+) -> Image.Image:
+    """TIP 상자가 차지한 가로 띠를 삭제해 빈 공간까지 함께 접는다."""
+    result = image.convert("RGB")
+    source_px = pdf_box_to_pixels(page, rendered, source_box)
+    for region in sorted(regions, key=lambda item: item.top, reverse=True):
+        region_box = (region.x0, region.top, region.x1, region.bottom)
+        region_px = pdf_box_to_pixels(page, rendered, region_box)
+        if region_px[2] <= source_px[0] or region_px[0] >= source_px[2]:
+            continue
+        y0 = max(0, region_px[1] - source_px[1])
+        y1 = min(result.height, region_px[3] - source_px[1])
+        if y1 <= y0:
+            continue
+        collapsed = Image.new("RGB", (result.width, result.height - (y1 - y0)), "white")
+        collapsed.paste(result.crop((0, 0, result.width, y0)), (0, 0))
+        collapsed.paste(result.crop((0, y1, result.width, result.height)), (0, y0))
+        result = collapsed
+    return result
+
+
+def prompt_header(
+    page,
+    rendered: Image.Image,
+    marker: MainMarker,
+    left: float,
+    right: float,
+    hard_bottom: float,
+) -> Image.Image | None:
+    """분할 이미지마다 반복할 큰 번호와 공통 발문을 추출한다."""
+    boundaries = [
+        sub.top for sub in sub_markers(page, left, right, marker.bottom, hard_bottom)
+        if sub.top > marker.bottom + 2
+    ]
+    boundaries.extend(
+        float(char["top"])
+        for char in getattr(page, "chars", [])
+        if str(char.get("text", "")) in "①②③④⑤"
+        and left <= float(char["x0"]) < right
+        and marker.bottom + 2 < float(char["top"]) < hard_bottom
+    )
+    if not boundaries:
+        return None
+    header_bottom = min(boundaries) - 3
+    if header_bottom <= marker.bottom + 4:
+        return None
+    box = tight_box(page, left, right, marker.top - 4, header_bottom)
+    if box is None:
+        return None
+    return rendered.crop(pdf_box_to_pixels(page, rendered, box)).convert("RGB")
 
 
 def tight_box(page, left: float, right: float, top: float, bottom: float):
@@ -230,6 +336,26 @@ def split_at_whitespace(image: Image.Image, max_height: int = MAX_IMAGE_HEIGHT) 
     return parts
 
 
+def split_with_repeated_header(
+    image: Image.Image,
+    header: Image.Image | None,
+    max_height: int = MAX_IMAGE_HEIGHT,
+) -> list[Image.Image]:
+    """긴 문제를 나누고 두 번째 조각부터 큰 번호·공통 발문을 다시 붙인다."""
+    if image.height <= max_height or header is None:
+        return split_at_whitespace(image, max_height)
+    reserve = header.height + 18
+    reduced_height = max(260, max_height - reserve)
+    parts = split_at_whitespace(image, reduced_height)
+    if len(parts) <= 1:
+        return parts
+    repeated = [parts[0]]
+    for part in parts[1:]:
+        body = part.crop((OUTPUT_MARGIN, OUTPUT_MARGIN, part.width - OUTPUT_MARGIN, part.height - OUTPUT_MARGIN))
+        repeated.append(add_margin(stack_left(header, body), OUTPUT_MARGIN))
+    return repeated
+
+
 def clean_concept_basic_image(image: Image.Image) -> Image.Image:
     """개념 기본 문제의 연한 살구색 페이지 장식을 지우고 내용에 맞춰 재단한다."""
     pixels = np.asarray(image.convert("RGB")).copy()
@@ -271,6 +397,7 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                 continue
             concept_basic_page = "개념기본문제" in re.sub(r"\s+", "", page.extract_text() or "")
             rendered = renderer[page_index].render(scale=scale).to_pil().convert("RGB")
+            page_tip_regions = tip_regions(page)
             page_serial = 0
             divider_lines = [
                 line for line in page.lines
@@ -315,14 +442,25 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                     box = tight_box(page, left, right, marker.top - 4, hard_bottom)
                     if box is None:
                         continue
-                    panels = [rendered.crop(pdf_box_to_pixels(page, rendered, box))]
+                    header = prompt_header(page, rendered, marker, left, right, hard_bottom)
+                    panel_boxes = [box]
                     if marker == continuation_owner and continuation_box is not None:
-                        panels.append(rendered.crop(pdf_box_to_pixels(page, rendered, continuation_box)))
+                        panel_boxes.append(continuation_box)
+                    panels = [
+                        remove_tip_bands(
+                            rendered.crop(pdf_box_to_pixels(page, rendered, panel_box)),
+                            page,
+                            rendered,
+                            panel_box,
+                            page_tip_regions,
+                        )
+                        for panel_box in panel_boxes
+                    ]
                     image = add_margin(stack_panels(panels), OUTPUT_MARGIN)
                     if concept_basic_page:
                         image = clean_concept_basic_image(image)
                     page_serial += 1
-                    parts = split_at_whitespace(image)
+                    parts = split_with_repeated_header(image, header)
                     for part_index, part in enumerate(parts, 1):
                         part_suffix = f"-{part_index:02d}" if len(parts) > 1 else ""
                         filename = f"{page_index + 1:03d}p_{page_serial:03d}{part_suffix}.png"

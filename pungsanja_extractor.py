@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pdfplumber
 import pypdfium2 as pdfium
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 CAPTURE_TOP_PADDING = 18.0
@@ -441,6 +441,46 @@ def pdf_box_to_pixels(page, rendered: Image.Image, box):
     )
 
 
+def is_long_decorative_rule(
+    kind: str,
+    box: tuple[float, float, float, float],
+    page_width: float,
+) -> bool:
+    """색과 관계없이 페이지/문항 박스를 이루는 긴 가로 장식선을 찾는다."""
+    x0, top, x1, bottom = box
+    width = x1 - x0
+    height = bottom - top
+    if width <= 0 or height < 0 or height > 14:
+        return False
+    # 곡선·얕은 사각형은 한 단 폭 정도만 되어도 장식선인 경우가 많다.
+    # 일반 직선은 답안선이나 도형일 가능성이 있어 더 긴 경우만 제거한다.
+    minimum_ratio = 0.38 if kind in {"curve", "rect"} else 0.62
+    return width >= page_width * minimum_ratio
+
+
+def remove_long_decorative_rules(page, rendered: Image.Image) -> Image.Image:
+    """렌더링된 페이지에서 색상과 무관하게 긴 가로 장식선만 지운다."""
+    result = rendered.convert("RGB").copy()
+    draw = ImageDraw.Draw(result)
+    collections = (
+        (getattr(page, "curves", []), "curve"),
+        (getattr(page, "rects", []), "rect"),
+        (getattr(page, "lines", []), "line"),
+    )
+    for objects, kind in collections:
+        for obj in objects:
+            if not all(key in obj for key in ("x0", "x1", "top", "bottom")):
+                continue
+            box = tuple(map(float, (obj["x0"], obj["top"], obj["x1"], obj["bottom"])))
+            if not is_long_decorative_rule(kind, box, float(page.width)):
+                continue
+            # 긴 선 끝의 둥근 모서리·색상 탭은 별도 곡선으로 저장되기도 한다.
+            # 좌우를 넉넉히 포함해 선 본체를 지운 뒤 조각만 남는 현상을 막는다.
+            padded = (box[0] - 16, box[1] - 3, box[2] + 16, box[3] + 3)
+            draw.rectangle(pdf_box_to_pixels(page, result, padded), fill="white")
+    return result
+
+
 def add_margin(image: Image.Image, margin: int) -> Image.Image:
     result = Image.new("RGB", (image.width + 2 * margin, image.height + 2 * margin), "white")
     result.paste(image.convert("RGB"), (margin, margin))
@@ -600,6 +640,7 @@ def extract(
                     else:
                         if rendered is None:
                             rendered = pdf[page_index].render(scale=scale).to_pil().convert("RGB")
+                            rendered = remove_long_decorative_rules(page, rendered)
                         image = rendered.crop(pdf_box_to_pixels(page, rendered, box))
                         image = add_margin(image, pixel_margin)
                         atomic_png_save(image, destination)

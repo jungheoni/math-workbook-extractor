@@ -19,6 +19,7 @@ from pungsanja_extractor import (
     determine_problem_box,
     is_colored_text,
     pdf_box_to_pixels,
+    remove_long_decorative_rules,
 )
 
 
@@ -271,6 +272,7 @@ def extract(source: Path, output: Path, scale: float = 3.0) -> list[Path]:
                 if kind == "skip":
                     continue
                 rendered = renderer[index].render(scale=scale).to_pil().convert("RGB")
+                rendered = remove_long_decorative_rules(page, rendered)
                 fn = {"regular": regular_page, "representative": representative_page,
                       "practice": practice_page}[kind]
                 current = fn(page, rendered, output, index + 1)

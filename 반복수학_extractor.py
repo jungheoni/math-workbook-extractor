@@ -17,7 +17,12 @@ import pypdfium2 as pdfium
 import numpy as np
 from PIL import Image
 
-from pungsanja_extractor import add_margin, is_colored_text, pdf_box_to_pixels
+from pungsanja_extractor import (
+    CAPTURE_TOP_PADDING,
+    add_margin,
+    is_colored_text,
+    pdf_box_to_pixels,
+)
 
 
 # 16:9 PPT의 좌상단 배치에서 20pt 상당 크기를 유지할 수 있는 최대 높이.
@@ -27,6 +32,13 @@ MAX_IMAGE_HEIGHT = 760
 SUBQUESTION_MAX_HEIGHT = 1200
 OUTPUT_MARGIN = 24
 CONTINUATION_GAP = 18
+# 소문항 사이에는 실제 풀이를 적을 수 있는 여백을 둔다. 짧은 문항도
+# 한 장에 과도하게 몰리지 않도록 최대 4개까지만 묶는다.
+SUBQUESTION_MIN_GAP = 140
+SUBQUESTION_MAX_GAP = 180
+MAX_SUBQUESTIONS_PER_IMAGE = 2
+# 큰 번호의 윗선보다 높게 솟는 분수, 근호, 연립식 첫 줄까지 발문에 포함한다.
+PROMPT_TOP_PADDING = CAPTURE_TOP_PADDING
 
 
 @dataclass(frozen=True)
@@ -351,14 +363,16 @@ def prompt_header(
     header_bottom = min(boundaries) - 3
     if header_bottom <= marker.bottom:
         return None
-    base_box = tight_box(page, left, right, marker.top - 4, header_bottom)
+    base_box = tight_box(
+        page, left, right, marker.top - PROMPT_TOP_PADDING, header_bottom
+    )
     if base_box is None:
         return None
     visual_box = common_prompt_visual_box(
         page,
         left,
         right,
-        marker.top - 4,
+        marker.top - PROMPT_TOP_PADDING,
         min(boundaries),
         sorted(boundaries)[1] - 3 if len(boundaries) > 1 else hard_bottom,
     )
@@ -386,9 +400,7 @@ def prompt_header(
         visual,
         (visual_px[0] - combined_px[0], visual_px[1] - combined_px[1]),
     )
-    return trim_horizontal_whitespace(
-        trim_vertical_whitespace(result, padding=8)
-    )
+    return trim_horizontal_whitespace(trim_vertical_whitespace(result))
 
 
 def common_prompt_visual_box(
@@ -610,13 +622,10 @@ def pack_subquestions_with_header(
     header: Image.Image,
     bodies: list[Image.Image],
     max_height: int = MAX_IMAGE_HEIGHT,
-    gap: int = 18,
+    gap: int = SUBQUESTION_MIN_GAP,
+    max_items: int = MAX_SUBQUESTIONS_PER_IMAGE,
 ) -> list[Image.Image]:
-    """소문항을 고정 간격으로 묶고 PPT 높이를 넘을 때만 다음 장으로 넘긴다.
-
-    각 body는 이미 실제 내용 범위로 재단되어 있으므로 원본 PDF의 소문항 간
-    좌표 차이/빈 공간은 최종 이미지에 반영되지 않는다.
-    """
+    """풀이 여백을 확보해 소문항을 최대 두 개씩 묶고 발문을 반복한다."""
     if not bodies:
         return []
 
@@ -631,12 +640,7 @@ def pack_subquestions_with_header(
 
     normalized = []
     for body in bodies:
-        # 원본 PDF의 소문항 간 세로 좌표 차이는 버리고 실제 내용 범위만 사용한다.
-        # 위아래 8px 안전 여백을 남겨 글자/수식/박스 선이 잘리지 않게 한다.
-        body = trim_vertical_whitespace(
-            trim_horizontal_whitespace(body),
-            padding=8,
-        )
+        body = trim_vertical_whitespace(trim_horizontal_whitespace(body))
         if body.height <= available:
             normalized.append(body)
             continue
@@ -651,14 +655,14 @@ def pack_subquestions_with_header(
                 max(OUTPUT_MARGIN + 1, part.height - OUTPUT_MARGIN),
             ))
             if has_meaningful_ink(inner):
-                normalized.append(trim_vertical_whitespace(inner, padding=8))
+                normalized.append(trim_vertical_whitespace(inner))
 
     groups: list[list[Image.Image]] = []
     current: list[Image.Image] = []
     current_height = 0
     for body in normalized:
         proposed = current_height + (gap if current else 0) + body.height
-        if current and proposed > available:
+        if current and (len(current) >= max_items or proposed > available):
             groups.append(current)
             current = [body]
             current_height = body.height
@@ -668,10 +672,24 @@ def pack_subquestions_with_header(
     if current:
         groups.append(current)
 
-    return [
-        add_margin(stack_left(header, stack_panels(group, gap)), OUTPUT_MARGIN)
-        for group in groups
-    ]
+    results = []
+    for group in groups:
+        # 짧은 문항에서는 남는 공간 일부를 풀이 여백으로 돌린다. 단, 간격이
+        # 지나치게 벌어져 서로 다른 문제처럼 보이지 않도록 상한을 둔다.
+        layout_gap = gap
+        if len(group) > 1:
+            remaining = available - sum(body.height for body in group)
+            layout_gap = min(
+                SUBQUESTION_MAX_GAP,
+                max(gap, remaining // (len(group) - 1)),
+            )
+        results.append(
+            add_margin(
+                stack_left(header, stack_panels(group, layout_gap)),
+                OUTPUT_MARGIN,
+            )
+        )
+    return results
 
 
 def _cut_crosses_vertical_border(
@@ -698,25 +716,14 @@ def _source_subquestion_boxes(
     top: float,
     bottom: float,
 ) -> list[tuple[str, tuple[float, float, float, float]]]:
-    """한 단 안의 (1), (2), ...를 각각 독립된 원자 영역으로 만든다.
-
-    원본 PDF에서 소문항 사이 간격이 제각각이어도 최종 배치에는 그 간격을
-    사용하지 않는다. 각 소문항은 실제 글자·수식·도형·보기·조건 박스의
-    외곽까지만 tight crop하고, 왼쪽은 소문항 번호를 기준으로 맞춘다.
-    """
+    """한 단 안의 (1), (2), ...를 각각 끊기지 않는 원본 영역으로 만든다."""
     subs = sub_markers(page, left, right, top, bottom)
     result = []
     for index, sub in enumerate(subs):
         end = subs[index + 1].top - 3 if index + 1 < len(subs) else bottom
-        box = tight_box(page, left, right, sub.top - 3, end)
-        if box is None:
-            continue
-
-        # 소문항 번호가 항상 동일한 x 기준선에서 시작하도록 왼쪽을 번호 기준으로 고정.
-        # 6pt 안전 여백을 남겨 괄호/획이 잘리지 않게 한다.
-        aligned_left = max(left, sub.x0 - 6)
-        box = (aligned_left, box[1], box[2], box[3])
-        result.append((sub.number, box))
+        box = tight_box(page, left, right, sub.top - 2, end)
+        if box is not None:
+            result.append((sub.number, box))
     return result
 
 
@@ -994,7 +1001,13 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                     )
                     # 소문항 위치와 관계없이 다음 큰 번호 직전까지 한 번만 저장한다.
                     # 원본 배치를 유지하므로 발문 반복/소문항 합성은 하지 않는다.
-                    box = tight_box(page, left, right, marker.top - 4, hard_bottom)
+                    box = tight_box(
+                        page,
+                        left,
+                        right,
+                        marker.top - PROMPT_TOP_PADDING,
+                        hard_bottom,
+                    )
                     if box is None:
                         continue
                     header = prompt_header(page, rendered, marker, left, right, hard_bottom)
@@ -1012,7 +1025,7 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                             page,
                             left,
                             right,
-                            marker.top - 4,
+                            marker.top - PROMPT_TOP_PADDING,
                             body_start,
                             later_tops[0] - 3 if later_tops else hard_bottom,
                         )
@@ -1126,10 +1139,8 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                                     atomic_box,
                                     page_tip_regions,
                                 )
-                                body_piece = trim_horizontal_whitespace(body_piece)
-                                body_piece = trim_vertical_whitespace(
-                                    body_piece,
-                                    padding=8,
+                                body_piece = trim_horizontal_whitespace(
+                                    trim_bottom_whitespace(body_piece)
                                 )
                                 if has_meaningful_ink(body_piece):
                                     atomic_bodies.append(body_piece)

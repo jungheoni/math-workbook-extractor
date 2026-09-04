@@ -9,7 +9,7 @@ import pdfplumber
 import pypdfium2 as pdfium
 from PIL import Image
 
-from pungsanja_extractor import Marker, assign_columns
+from pungsanja_extractor import CAPTURE_TOP_PADDING, Marker, assign_columns
 from 필수유형_extractor import crop, save, tight_box
 
 
@@ -101,7 +101,9 @@ def extract_page(page, rendered: Image.Image, output: Path, page_no: int) -> lis
             ]
             if solution_tops:
                 bottom = min(solution_tops) - 5
-            box = tight_box(page, left, right, marker.top - 5, bottom)
+            box = tight_box(
+                page, left, right, marker.top - CAPTURE_TOP_PADDING, bottom
+            )
             if box is None:
                 continue
             serial += 1

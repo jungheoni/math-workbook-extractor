@@ -25,13 +25,11 @@ from PIL import Image
 
 
 PROFILES = {
-    "pungsanja": {"digits": 3, "label": "풍산자", "top_padding": 0.0},
+    "pungsanja": {"digits": 3, "label": "풍산자", "top_padding": 1.5},
     # 구판은 색상 2자리, 신판은 회색 2자리+색상 1자리의 3자리 번호다.
-    # 최고난도는 번호 글자의 실제 렌더링 영역이 PDF 텍스트 bbox보다 위로
-    # 조금 더 올라가는 경우가 있어, 번호 상단이 잘리지 않도록 6pt를 추가한다.
-    "최고난도": {"digits": (3, 2), "label": "최고난도", "top_padding": 6.0},
+    "최고난도": {"digits": (3, 2), "label": "최고난도", "top_padding": 5.0},
     # 이전 실행 명령과 진행 기록을 위한 호환 별칭
-    "choegonado": {"digits": (3, 2), "label": "최고난도", "top_padding": 6.0},
+    "choegonado": {"digits": (3, 2), "label": "최고난도", "top_padding": 5.0},
 }
 STOP_WORDS = ("풍산자曰", "풀이", "해설", "정답")
 SOLUTION_PATTERNS = (
@@ -120,7 +118,15 @@ def find_markers(page, digits: int = 3) -> list[Marker]:
     markers = []
     for word in words:
         text = str(word["text"]).strip()
-        if number_re.fullmatch(text) and is_colored_text(word.get("non_stroking_color")):
+        # Thumbnail/contents pages can contain miniature colored page samples.
+        # Their three-digit numbers are only 2-3pt high, while real Pungsanja
+        # problem numbers in supported editions are at least about 13pt high.
+        word_height = float(word["bottom"]) - float(word["top"])
+        if (
+            number_re.fullmatch(text)
+            and 8 <= word_height <= 28
+            and is_colored_text(word.get("non_stroking_color"))
+        ):
             markers.append(
                 Marker(
                     text,
@@ -152,6 +158,9 @@ def find_markers(page, digits: int = 3) -> list[Marker]:
 
     for run in runs:
         if len(run) != digits:
+            continue
+        sizes = [float(char.get("size", 0)) for char in run]
+        if not sizes or not 8 <= sum(sizes) / len(sizes) <= 28:
             continue
         # 최고난도 신판처럼 회색 숫자와 색상 숫자가 섞인 번호도 허용하되,
         # 페이지 번호처럼 전부 무채색인 숫자는 제외한다.
@@ -264,9 +273,36 @@ def is_stop_line(line: Box, marker: Marker) -> bool:
 
 def is_decorative_outer_box(box: Box, marker: Marker, column_width: float) -> bool:
     """Outer cards contain the number; inner expression/choice boxes do not."""
-    contains_marker_y = box.top <= marker.top + 5 and box.bottom >= marker.bottom + 20
-    very_wide = box.width >= column_width * 0.70
+    # Some Pungsanja editions draw the question card as one or more curves.
+    # The visible card can be only about 66% of a one-column page wide and its
+    # lower edge may sit just 5-12pt below the number.  The former thresholds
+    # (70% / 20pt) therefore treated the card itself as problem content.
+    # Requiring the object to enclose the marker still keeps expression,
+    # condition and choice boxes below the prompt out of this classification.
+    contains_marker_y = (
+        box.top <= marker.top + 5
+        and box.bottom >= marker.bottom + 5
+    )
+    very_wide = box.width >= column_width * 0.60
     return contains_marker_y and very_wide
+
+
+def is_decorative_outer_companion(
+    box: Box,
+    outer_boxes: list[Box],
+    column_width: float,
+) -> bool:
+    """Match curve fragments that form the same card as a detected outer box."""
+    if box.kind not in {"curve", "rect", "line"}:
+        return False
+    if box.width < column_width * 0.60:
+        return False
+    return any(
+        abs(box.x0 - outer.x0) <= 3
+        and abs(box.x1 - outer.x1) <= 3
+        and abs(box.top - outer.top) <= 3
+        for outer in outer_boxes
+    )
 
 
 def determine_problem_box(
@@ -277,11 +313,23 @@ def determine_problem_box(
     right: float,
     max_gap: float,
     source_padding: float,
-    top_padding: float = 0.0,
+    top_padding: float | None = None,
 ) -> tuple[float, float, float, float] | None:
     footer_limit = page.height - 90
     hard_end = min(next_marker.top if next_marker else footer_limit, footer_limit)
     lines = group_word_lines(page, left, right)
+    column_width = right - left
+    graphics = graphic_boxes(page, left, right)
+
+    # A following boxed problem begins above its printed number. Stop before
+    # that card's top stroke so even a thin arc cannot leak into this crop.
+    if next_marker is not None:
+        next_outer_boxes = [
+            box for box in graphics
+            if is_decorative_outer_box(box, next_marker, column_width)
+        ]
+        if next_outer_boxes:
+            hard_end = min(hard_end, min(box.top for box in next_outer_boxes) - 1.5)
 
     for line in lines:
         if marker.bottom < line.top < hard_end and is_stop_line(line, marker):
@@ -293,7 +341,12 @@ def determine_problem_box(
         has_korean_caption = bool(re.search(r"[가-힣]", normalized))
         right_aligned_caption = (
             line.top > marker.bottom + 8
-            and line.x0 > left + (right - left) * 0.70
+            # Never let a caption belonging to a later problem move the
+            # current problem's boundary past the next numbered marker.
+            and line.top < hard_end
+            # Some editions start this right-side caption at about 66% of a
+            # one-column page, slightly left of the older 70% threshold.
+            and line.x0 > left + (right - left) * 0.64
             # 도형의 꼭짓점명(A, B, C 등)을 다음 코너 제목으로 오인하면
             # 도형 한가운데에서 잘린다. 한글이 포함된 실제 캡션만 종료
             # 신호로 인정하고, 지나치게 짧은 표시는 제외한다.
@@ -303,17 +356,22 @@ def determine_problem_box(
         if right_aligned_caption:
             # 렌더링 반올림으로 다음 캡션의 첫 픽셀이 섞이지 않도록 아주
             # 작은 간격만 둔다. 바로 위 도형 라벨은 그대로 보존된다.
-            hard_end = line.top - 1.5
+            hard_end = min(hard_end, line.top - 1.5)
             break
 
     candidates: list[Box] = [
         line for line in lines if marker.top - 3 <= line.top < hard_end
     ]
-    column_width = right - left
-    decorative_bottoms: list[float] = []
-    for box in graphic_boxes(page, left, right):
-        if is_decorative_outer_box(box, marker, column_width):
-            decorative_bottoms.append(box.bottom)
+    decorative_boxes = [
+        box for box in graphics
+        if is_decorative_outer_box(box, marker, column_width)
+    ]
+    decorative_bottoms = [box.bottom for box in decorative_boxes]
+    for box in graphics:
+        if (
+            box in decorative_boxes
+            or is_decorative_outer_companion(box, decorative_boxes, column_width)
+        ):
             continue
         # 도형이 여러 곡선 조각으로 분리된 PDF에서는 객체의 중심점이나
         # 끝점이 탐색 구간 밖에 있어도 실제 선은 문제 영역과 이어질 수 있다.
@@ -350,24 +408,15 @@ def determine_problem_box(
         return None
 
     x0 = max(left, min(box.x0 for box in connected) - source_padding)
-
-    # 일반 풍산자는 기존 크롭 위치를 유지한다.
-    # 최고난도처럼 번호의 실제 잉크 영역이 텍스트 bbox 위로 올라가는 교재는
-    # marker.top보다 추가로 위쪽을 포함해 번호 윗부분이 잘리지 않게 한다.
-    content_top = max(
-        marker.top - source_padding,
-        min(box.top for box in connected) - source_padding,
-    )
-    if top_padding > 0:
-        content_top = min(content_top, marker.top - top_padding)
-    top = max(0.0, content_top)
-
+    top = max(0, marker.top - (top_padding if top_padding is not None else source_padding))
     x1 = min(right, max(box.x1 for box in connected) + source_padding)
     bottom = min(hard_end, max(box.bottom for box in connected) + source_padding)
     # A PDF can contain invisible/stray text on a card border. Never let that
     # pull the crop far enough to reveal the decorative outer bottom line.
     if decorative_bottoms:
-        bottom = min(bottom, min(decorative_bottoms) - 5.0)
+        # A small inset removes the stroke without consuming low mathematical
+        # glyphs whose PDF bounding boxes can extend close to the card edge.
+        bottom = min(bottom, min(decorative_bottoms) - 1.5)
     return (x0, top, x1, bottom)
 
 
@@ -440,7 +489,6 @@ def extract(
     if profile not in PROFILES:
         raise ValueError(f"알 수 없는 교재 프로필: {profile}")
     profile_settings = PROFILES[profile]
-    profile_top_padding = float(profile_settings.get("top_padding", 0.0))
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf = pdfium.PdfDocument(str(pdf_path))
     progress_path = output_dir.parent / f"{output_dir.name}_progress.json"
@@ -452,9 +500,7 @@ def extract(
         "digits": profile_settings["digits"],
         "scale": scale,
         "max_gap": max_gap,
-        "source_padding": source_padding,
-        "pixel_margin": pixel_margin,
-        "top_padding": profile_top_padding,
+        "top_padding": profile_settings.get("top_padding", source_padding),
     }
     records: dict[str, dict] = {}
 
@@ -530,7 +576,7 @@ def extract(
                         right,
                         max_gap,
                         source_padding,
-                        profile_top_padding,
+                        float(profile_settings.get("top_padding", source_padding)),
                     )
                     if box is None:
                         print(f"warning: could not determine problem {marker.number} on page {page_index + 1}")

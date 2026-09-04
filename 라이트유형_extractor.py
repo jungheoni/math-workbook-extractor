@@ -15,6 +15,7 @@ from pungsanja_extractor import (
     Marker,
     assign_columns,
     is_colored_text,
+    remove_long_decorative_rules,
 )
 from 필수유형_extractor import crop, save, stack, tight_box
 
@@ -313,7 +314,9 @@ def extract(source: Path, output: Path, scale: float = 3.0) -> list[Path]:
                     continue
                 current = []
                 if ranges(page):
-                    current = concept_practice(page, renderer[index].render(scale=scale).to_pil().convert("RGB"), output, index + 1)
+                    rendered = renderer[index].render(scale=scale).to_pil().convert("RGB")
+                    rendered = remove_long_decorative_rules(page, rendered)
+                    current = concept_practice(page, rendered, output, index + 1)
                     kind = "concept"
                 else:
                     page_markers = markers(page)
@@ -321,6 +324,7 @@ def extract(source: Path, output: Path, scale: float = 3.0) -> list[Path]:
                     if not page_markers and not has_type_examples:
                         continue
                     rendered = renderer[index].render(scale=scale).to_pil().convert("RGB")
+                    rendered = remove_long_decorative_rules(page, rendered)
                     examples = type_examples(page, rendered, output, index + 1) if has_type_examples else []
                     exercises = regular(page, rendered, output, index + 1, serial_start=len(examples)) if page_markers else []
                     current = examples + exercises

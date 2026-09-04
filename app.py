@@ -20,6 +20,9 @@ from ppt_dark_converter import convert_pptx_mode
 from pdf_dark_converter import convert_pdf_outputs
 
 
+APP_VERSION = "2026.09.04-r2"
+
+
 BOOKS = {
     "풍산자": {
         "description": "색이 적용된 세 자리 번호를 기준으로 문제·도형·내부 박스를 보존합니다.",
@@ -271,4 +274,7 @@ if "converted_dark_pptx" in st.session_state:
             use_container_width=True,
         )
 st.markdown("</div>", unsafe_allow_html=True)
-st.markdown('<div class="footer-note">업로드 파일과 추출 결과는 처리 중에만 임시로 사용됩니다.</div>', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="footer-note">업로드 파일과 추출 결과는 처리 중에만 임시로 사용됩니다.<br>버전 {APP_VERSION}</div>',
+    unsafe_allow_html=True,
+)

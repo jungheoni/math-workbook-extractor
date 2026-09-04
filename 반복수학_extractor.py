@@ -22,6 +22,7 @@ from pungsanja_extractor import (
     add_margin,
     is_colored_text,
     pdf_box_to_pixels,
+    remove_long_decorative_rules,
 )
 
 
@@ -918,6 +919,7 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
                 continue
             concept_basic_page = "개념기본문제" in re.sub(r"\s+", "", page.extract_text() or "")
             rendered = renderer[page_index].render(scale=scale).to_pil().convert("RGB")
+            rendered = remove_long_decorative_rules(page, rendered)
             page_tip_regions = tip_regions(page) + point_regions(page)
             page_serial = 0
             divider_lines = [

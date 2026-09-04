@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image
 
 from pungsanja_extractor import (
+    CAPTURE_TOP_PADDING,
     Marker,
     add_margin,
     assign_columns,
@@ -161,7 +162,9 @@ def regular_page(page, rendered, output: Path, page_no: int) -> list[Path]:
             # 그래프·보기·선택지가 본문과 멀리 떨어진 편집도 있으므로
             # 같은 단의 다음 번호 직전까지 존재하는 모든 콘텐츠를 보존한다.
             end = nxt.top - 5 if nxt else page.height - 90
-            box = tight_box(page, left, right, marker.top - 4, end)
+            box = tight_box(
+                page, left, right, marker.top - CAPTURE_TOP_PADDING, end
+            )
             if box is None:
                 continue
             serial += 1
@@ -231,7 +234,7 @@ def practice_page(page, rendered, output: Path, page_no: int) -> list[Path]:
         right = page.width / 2 - 3 if col == 0 else page.width - 55
         cms = [w for w in markers if int(float(w["x0"]) >= page.width / 2) == col]
         for index, marker in enumerate(cms):
-            top = float(marker["top"]) - 5
+            top = float(marker["top"]) - CAPTURE_TOP_PADDING
             end = float(cms[index + 1]["top"]) - 8 if index + 1 < len(cms) else page.height - 90
             region = [w for w in ws if left <= float(w["x0"]) < right and top < float(w["top"]) < end]
             solution = [float(w["top"]) for w in region if norm(w["text"]) == "풀이"]

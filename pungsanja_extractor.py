@@ -24,12 +24,15 @@ import pypdfium2 as pdfium
 from PIL import Image
 
 
+CAPTURE_TOP_PADDING = 18.0
+
+
 PROFILES = {
-    "pungsanja": {"digits": 3, "label": "풍산자", "top_padding": 1.5},
+    "pungsanja": {"digits": 3, "label": "풍산자", "top_padding": CAPTURE_TOP_PADDING},
     # 구판은 색상 2자리, 신판은 회색 2자리+색상 1자리의 3자리 번호다.
-    "최고난도": {"digits": (3, 2), "label": "최고난도", "top_padding": 5.0},
+    "최고난도": {"digits": (3, 2), "label": "최고난도", "top_padding": CAPTURE_TOP_PADDING},
     # 이전 실행 명령과 진행 기록을 위한 호환 별칭
-    "choegonado": {"digits": (3, 2), "label": "최고난도", "top_padding": 5.0},
+    "choegonado": {"digits": (3, 2), "label": "최고난도", "top_padding": CAPTURE_TOP_PADDING},
 }
 STOP_WORDS = ("풍산자曰", "풀이", "해설", "정답")
 SOLUTION_PATTERNS = (
@@ -315,6 +318,10 @@ def determine_problem_box(
     source_padding: float,
     top_padding: float | None = None,
 ) -> tuple[float, float, float, float] | None:
+    effective_top_padding = (
+        top_padding if top_padding is not None else source_padding
+    )
+    scan_top = marker.top - effective_top_padding
     footer_limit = page.height - 90
     hard_end = min(next_marker.top if next_marker else footer_limit, footer_limit)
     lines = group_word_lines(page, left, right)
@@ -360,7 +367,7 @@ def determine_problem_box(
             break
 
     candidates: list[Box] = [
-        line for line in lines if marker.top - 3 <= line.top < hard_end
+        line for line in lines if scan_top <= line.top < hard_end
     ]
     decorative_boxes = [
         box for box in graphics
@@ -376,7 +383,7 @@ def determine_problem_box(
         # 도형이 여러 곡선 조각으로 분리된 PDF에서는 객체의 중심점이나
         # 끝점이 탐색 구간 밖에 있어도 실제 선은 문제 영역과 이어질 수 있다.
         # 탐색 구간과 조금이라도 겹치면 객체 전체를 후보로 유지한다.
-        if box.bottom < marker.top - 3 or box.top >= hard_end:
+        if box.bottom < scan_top or box.top >= hard_end:
             continue
         if box.x0 < left - 2 or box.x1 > right + 2:
             continue
@@ -390,7 +397,7 @@ def determine_problem_box(
     cursor = marker.bottom
     started = False
     for box in candidates:
-        if box.bottom < marker.top - 1:
+        if box.bottom < scan_top:
             continue
         if not started:
             if box.top <= marker.bottom + 5:
@@ -408,7 +415,7 @@ def determine_problem_box(
         return None
 
     x0 = max(left, min(box.x0 for box in connected) - source_padding)
-    top = max(0, marker.top - (top_padding if top_padding is not None else source_padding))
+    top = max(0, scan_top)
     x1 = min(right, max(box.x1 for box in connected) + source_padding)
     bottom = min(hard_end, max(box.bottom for box in connected) + source_padding)
     # A PDF can contain invisible/stray text on a card border. Never let that

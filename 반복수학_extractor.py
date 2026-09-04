@@ -424,7 +424,11 @@ def common_prompt_visual_box(
             object_width, object_height = x1 - x0, y1 - y0
             if x1 <= left or x0 >= right or y1 <= header_top or y0 >= maximum_bottom:
                 continue
-            if object_width > width * 0.88 and object_height < 4:
+            # 페이지 상단 장식선은 얇은 곡선으로 저장되는 경우가 있어 높이가
+            # 4pt를 조금 넘기도 한다. 이 선이 오른쪽 공통 도형과 연결되면
+            # 도형 상자가 왼쪽 소문항까지 확장되어 (1)과 풀이가 발문에 반복된다.
+            # 한 단 폭에 가까운 얕은 객체는 공통 도형 구성요소에서 제외한다.
+            if object_width > width * 0.88 and object_height < 12:
                 continue
             if object_height > (maximum_bottom - header_top) * 0.85 and object_width < 4:
                 continue
@@ -470,6 +474,12 @@ def common_prompt_visual_box(
     for char in getattr(page, "chars", []):
         cx = (float(char["x0"]) + float(char["x1"])) / 2
         cy = (float(char["top"]) + float(char["bottom"])) / 2
+        # 주변 문자 때문에 도형 상자 자체가 넓어지지 않도록 점·축 이름에
+        # 흔히 쓰이는 영문/숫자만 경계 확장에 사용한다. 한글 발문이 도형에
+        # 인접해 상자를 왼쪽으로 끌면 그 아래의 (1)과 풀이까지 원본 crop에
+        # 들어와 모든 분할 이미지에 반복되는 문제가 생긴다.
+        if not re.fullmatch(r"[A-Za-z0-9]", str(char.get("text", "")).strip()):
+            continue
         if x0 - 8 <= cx <= x1 + 8 and y0 - 8 <= cy <= y1 + 8:
             nearby_chars.append(char)
     if nearby_chars:

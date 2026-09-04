@@ -11,6 +11,7 @@ from pungsanja_extractor import (
     add_margin,
     is_colored_text,
     pdf_box_to_pixels,
+    remove_long_decorative_rules,
 )
 
 @dataclass(frozen=True)
@@ -152,7 +153,7 @@ def extract(source:Path,output:Path,scale:float=3.0):
             for i,page in enumerate(doc.pages):
                 kind=classify(page)
                 if kind=="skip": continue
-                image=renderer[i].render(scale=scale).to_pil().convert("RGB"); fn={"examples":examples,"types":types,"written":written,"numbered":numbered}[kind]; made=fn(page,image,output,i+1); result.extend(made); print(f"page {i+1}: {kind}, {len(made)} image(s)")
+                image=renderer[i].render(scale=scale).to_pil().convert("RGB"); image=remove_long_decorative_rules(page,image); fn={"examples":examples,"types":types,"written":written,"numbered":numbered}[kind]; made=fn(page,image,output,i+1); result.extend(made); print(f"page {i+1}: {kind}, {len(made)} image(s)")
     finally: renderer.close()
     return sorted(result)
 

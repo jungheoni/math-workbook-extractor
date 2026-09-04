@@ -9,7 +9,12 @@ import pdfplumber
 import pypdfium2 as pdfium
 from PIL import Image
 
-from pungsanja_extractor import CAPTURE_TOP_PADDING, Marker, assign_columns
+from pungsanja_extractor import (
+    CAPTURE_TOP_PADDING,
+    Marker,
+    assign_columns,
+    remove_long_decorative_rules,
+)
 from 필수유형_extractor import crop, save, tight_box
 
 
@@ -126,6 +131,7 @@ def extract(source: Path, output: Path, scale: float = 3.0) -> list[Path]:
                     if "테스트[" not in text and "테스트［" not in text:
                         continue
                 rendered = renderer[index].render(scale=scale).to_pil().convert("RGB")
+                rendered = remove_long_decorative_rules(page, rendered)
                 current = extract_page(page, rendered, output, index + 1)
                 made.extend(current)
                 print(f"page {index + 1}: {len(current)} image(s)")

@@ -20,7 +20,7 @@ from ppt_dark_converter import convert_pptx_mode
 from pdf_dark_converter import convert_pdf_outputs
 
 
-APP_VERSION = "2026.09.07-r1"
+APP_VERSION = "2026.09.07-r2"
 
 
 BOOKS = {
@@ -139,8 +139,16 @@ book = st.session_state["selected_book"]
 st.caption(f"선택한 교재 · {book}")
 uploaded = st.file_uploader("문제집 PDF", type=("pdf",), accept_multiple_files=False)
 
-# 교재 또는 업로드 파일이 바뀌면 이전 실행의 ZIP을 절대 다시 보여주지 않는다.
-input_signature = (book, uploaded.name, uploaded.size) if uploaded is not None else (book, None, 0)
+# 교재·업로드 인스턴스·앱 버전 중 하나라도 바뀌면 이전 결과를 지운다.
+# 이름과 크기만 비교하면 같은 파일을 다시 올렸거나 배포 직후에도 기존
+# 세션의 PNG/PPT가 남아, 새 추출 코드 대신 예전 결과를 다운로드할 수 있다.
+input_signature = (
+    APP_VERSION,
+    book,
+    getattr(uploaded, "file_id", None),
+    uploaded.name,
+    uploaded.size,
+) if uploaded is not None else (APP_VERSION, book, None, None, 0)
 if st.session_state.get("input_signature") != input_signature:
     for key in (
         "result_zip", "result_pptx",

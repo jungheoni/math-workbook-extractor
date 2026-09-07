@@ -20,7 +20,7 @@ from ppt_dark_converter import convert_pptx_mode
 from pdf_dark_converter import convert_pdf_outputs
 
 
-APP_VERSION = "2026.09.04-r3"
+APP_VERSION = "2026.09.07-r1"
 
 
 BOOKS = {
@@ -278,3 +278,4 @@ st.markdown(
     f'<div class="footer-note">업로드 파일과 추출 결과는 처리 중에만 임시로 사용됩니다.<br>버전 {APP_VERSION}</div>',
     unsafe_allow_html=True,
 )
+ 

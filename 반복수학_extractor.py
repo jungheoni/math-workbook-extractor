@@ -330,6 +330,36 @@ def trim_bottom_whitespace(image: Image.Image, padding: int = 12) -> Image.Image
     return rgb.crop((0, 0, rgb.width, bottom))
 
 
+def subquestion_ink_top(page, sub, left, right):
+    """Include tall parentheses and numerators above a subquestion label.
+
+    Follow vertically overlapping glyphs on the same math row, rather than
+    applying a fixed offset that can cut fractions or include the previous row.
+    """
+    low, high = sub.top, sub.bottom
+    chars = [c for c in getattr(page, "chars", [])
+             if left <= (float(c["x0"]) + float(c["x1"])) / 2 < right
+             and str(c.get("text", "")).strip()]
+    for _ in range(4):
+        connected = [c for c in chars
+                     if float(c["bottom"]) > low + 0.5
+                     and float(c["top"]) < high - 0.5]
+        if not connected:
+            break
+        new_low = min(low, min(float(c["top"]) for c in connected))
+        new_high = max(high, max(float(c["bottom"]) for c in connected))
+        if (new_low, new_high) == (low, high):
+            break
+        low, high = new_low, new_high
+    # Legacy math fonts encode a whole stacked fraction as glyphs whose PDF
+    # text boxes describe only the baseline. Reserve ascent for their visible
+    # numerator as well; use the SAME boundary for header and body ownership.
+    legacy_fraction = any(str(c.get("text", "")) == ";"
+                          and float(c["bottom"]) > low
+                          and float(c["top"]) < high for c in chars)
+    return low - (12.0 if legacy_fraction else 0.0)
+
+
 def prompt_header(
     page,
     rendered: Image.Image,
@@ -346,7 +376,7 @@ def prompt_header(
     텍스트는 머리 이미지에서 제외한다.
     """
     boundaries = [
-        sub.top for sub in sub_markers(page, left, right, marker.bottom, hard_bottom)
+        subquestion_ink_top(page, sub, left, right) for sub in sub_markers(page, left, right, marker.bottom, hard_bottom)
         if sub.top > marker.bottom + 2
     ]
     boundaries.extend(
@@ -731,8 +761,9 @@ def _source_subquestion_boxes(
     subs = sub_markers(page, left, right, top, bottom)
     result = []
     for index, sub in enumerate(subs):
-        end = subs[index + 1].top - 3 if index + 1 < len(subs) else bottom
-        box = tight_box(page, left, right, sub.top - 2, end)
+        end = subquestion_ink_top(page, subs[index + 1], left, right) - 3 if index + 1 < len(subs) else bottom
+        start = subquestion_ink_top(page, sub, left, right) - 4
+        box = tight_box(page, left, right, start, end)
         if box is not None:
             result.append((sub.number, box))
     return result

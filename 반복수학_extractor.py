@@ -1227,3 +1227,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     results = extract(args.pdf, args.output)
     print(f"done: {len(results)} image(s)")
+ 

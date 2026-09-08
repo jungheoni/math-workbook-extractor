@@ -357,7 +357,22 @@ def subquestion_ink_top(page, sub, left, right):
     legacy_fraction = any(str(c.get("text", "")) == ";"
                           and float(c["bottom"]) > low
                           and float(c["top"]) < high for c in chars)
-    return low - (12.0 if legacy_fraction else 0.0)
+    low -= 12.0 if legacy_fraction else 0.0
+    # Custom math fonts can draw a brace/upper equation outside their text
+    # boxes. Find the white row above the visible expression in the render.
+    ink = getattr(page, "_capture_ink", None)
+    if ink is not None:
+        sy, sx = ink.shape[0] / float(page.height), ink.shape[1] / float(page.width)
+        x0, x1 = max(0, int(left*sx)), min(ink.shape[1], int(right*sx))
+        start = min(ink.shape[0]-1, int((sub.top+sub.bottom)*0.5*sy))
+        limit = max(0, int((sub.top-45)*sy))
+        quiet = 0
+        for y in range(start, limit-1, -1):
+            quiet = quiet+1 if not ink[y, x0:x1].any() else 0
+            if quiet >= max(2, round(sy)):
+                low = min(low, (y+quiet)/sy)
+                break
+    return low
 
 
 def prompt_header(
@@ -392,7 +407,7 @@ def prompt_header(
     # 시작할 수 있다. 3pt 안전 간격을 둬 첫 소문항 수식이 발문 머리에
     # 섞이는 것을 막되, 발문과 (1)이 매우 가까운 판본도 유지한다.
     header_bottom = min(boundaries) - 3
-    if header_bottom <= marker.bottom:
+    if header_bottom <= marker.top + 3:
         return None
     base_box = tight_box(
         page, left, right, marker.top - PROMPT_TOP_PADDING, header_bottom
@@ -951,6 +966,7 @@ def extract(pdf_path: Path, output_dir: Path, scale: float = 3.0) -> list[Path]:
             concept_basic_page = "개념기본문제" in re.sub(r"\s+", "", page.extract_text() or "")
             rendered = renderer[page_index].render(scale=scale).to_pil().convert("RGB")
             rendered = remove_long_decorative_rules(page, rendered)
+            page._capture_ink = np.min(np.asarray(rendered), axis=2) < 235
             page_tip_regions = tip_regions(page) + point_regions(page)
             page_serial = 0
             divider_lines = [

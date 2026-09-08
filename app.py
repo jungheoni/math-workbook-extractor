@@ -20,7 +20,7 @@ from ppt_dark_converter import convert_pptx_mode
 from pdf_dark_converter import convert_pdf_outputs
 
 
-APP_VERSION = "2026.09.07-r2"
+APP_VERSION = "2026.09.08-r1"
 
 
 BOOKS = {

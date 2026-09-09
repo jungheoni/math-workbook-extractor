@@ -40,7 +40,7 @@ SOLUTION_PATTERNS = (
     re.compile(r"\[1단계\]"),
     re.compile(r"나타낸후.*대입"),
 )
-ANSWER_REFERENCE_RE = re.compile(r"정답과(?:풀이|해설)\d*쪽?")
+ANSWER_REFERENCE_RE = re.compile(r"정답과(?:풀이|해설)\d*쪽?"); SUPPLEMENT_LABEL_RE = re.compile(r"(?:풍산자)?(?:비법|TIP|POINT)", re.IGNORECASE); is_supplement_label = lambda line: re.sub(r"\s+", "", line.text) == "풍산자" or bool(SUPPLEMENT_LABEL_RE.fullmatch(re.sub(r"\s+", "", line.text)))
 
 
 @dataclass(frozen=True)
@@ -346,8 +346,8 @@ def determine_problem_box(
             hard_end = min(hard_end, min(box.top for box in next_outer_boxes) - 1.5)
 
     for line in lines:
-        if marker.bottom < line.top < hard_end and is_stop_line(line, marker):
-            hard_end = line.top
+        if marker.bottom < line.top < hard_end and (is_stop_line(line, marker) or is_supplement_label(line)):
+            hard_end = line.top - 18.0 if is_supplement_label(line) else line.top
             break
         # 풍산자의 next-section captions are short, right-aligned labels
         # (often preceded by an orange dot drawn as a separate vector object).

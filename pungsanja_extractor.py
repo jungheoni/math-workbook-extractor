@@ -40,6 +40,7 @@ SOLUTION_PATTERNS = (
     re.compile(r"\[1단계\]"),
     re.compile(r"나타낸후.*대입"),
 )
+ANSWER_REFERENCE_RE = re.compile(r"정답과(?:풀이|해설)\d*쪽?")
 
 
 @dataclass(frozen=True)
@@ -274,6 +275,12 @@ def is_stop_line(line: Box, marker: Marker) -> bool:
     )
 
 
+def is_answer_reference(line: Box) -> bool:
+    """Return True for small page furniture such as '정답과 풀이 2쪽'."""
+    normalized = re.sub(r"\s+", "", line.text)
+    return bool(ANSWER_REFERENCE_RE.fullmatch(normalized))
+
+
 def is_decorative_outer_box(box: Box, marker: Marker, column_width: float) -> bool:
     """Outer cards contain the number; inner expression/choice boxes do not."""
     # Some Pungsanja editions draw the question card as one or more curves.
@@ -367,7 +374,9 @@ def determine_problem_box(
             break
 
     candidates: list[Box] = [
-        line for line in lines if scan_top <= line.top < hard_end
+        line
+        for line in lines
+        if scan_top <= line.top < hard_end and not is_answer_reference(line)
     ]
     decorative_boxes = [
         box for box in graphics
@@ -441,6 +450,19 @@ def pdf_box_to_pixels(page, rendered: Image.Image, box):
     )
 
 
+def prevent_previous_problem_overlap(
+    box: tuple[float, float, float, float],
+    marker: Marker,
+    previous_bottom: float | None,
+) -> tuple[float, float, float, float]:
+    """Keep expanded top padding from re-capturing the previous problem."""
+    if previous_bottom is None:
+        return box
+    x0, top, x1, bottom = box
+    safe_top = min(marker.top - 2, previous_bottom + 1.5)
+    return (x0, max(top, safe_top), x1, bottom)
+
+
 def is_long_decorative_rule(
     kind: str,
     box: tuple[float, float, float, float],
@@ -456,6 +478,86 @@ def is_long_decorative_rule(
     # 일반 직선은 답안선이나 도형일 가능성이 있어 더 긴 경우만 제거한다.
     minimum_ratio = 0.38 if kind in {"curve", "rect"} else 0.62
     return width >= page_width * minimum_ratio
+
+
+def is_problem_card_top_fragment(
+    box: Box,
+    marker: Marker,
+    column_width: float,
+) -> bool:
+    """Detect the curved top/side fragment surrounding a Pungsanja number."""
+    if box.kind not in {"curve", "rect", "line"}:
+        return False
+    return (
+        box.width >= column_width * 0.60
+        and box.height <= 35
+        and box.x0 - 2 <= marker.x0 <= box.x0 + 22
+        and marker.top - 20 <= box.bottom
+        and box.top <= marker.top + 5
+    )
+
+
+def remove_page_furniture(
+    page,
+    rendered: Image.Image,
+    markers: list[Marker],
+    column_count: int,
+) -> Image.Image:
+    """Erase answer-page references and outer question-card strokes only."""
+    result = rendered.convert("RGB").copy()
+    draw = ImageDraw.Draw(result)
+
+    page_lines = group_word_lines(page, 0, float(page.width))
+    for line in page_lines:
+        if is_answer_reference(line):
+            padded = (line.x0 - 2, line.top - 2, line.x1 + 2, line.bottom + 2)
+            draw.rectangle(pdf_box_to_pixels(page, result, padded), fill="white")
+
+    column_width = float(page.width) / max(1, column_count)
+    graphics = graphic_boxes(page, 0, float(page.width))
+    for marker in markers:
+        fragments = [
+            box
+            for box in graphics
+            if is_problem_card_top_fragment(box, marker, column_width)
+        ]
+        for box in fragments:
+            # The curve's bounding box overlaps the printed number. Erase only
+            # its top stroke and short side strokes, never the box interior.
+            top_band = (box.x0 - 3, box.top - 3, box.x1 + 3, box.top + 4)
+            left_band = (box.x0 - 3, box.top - 3, box.x0 + 4, box.bottom + 3)
+            right_band = (box.x1 - 4, box.top - 3, box.x1 + 3, box.bottom + 3)
+            for band in (top_band, left_band, right_band):
+                draw.rectangle(pdf_box_to_pixels(page, result, band), fill="white")
+
+            # Some editions attach a small STEP/title tab to the left end of
+            # the long card stroke. Its lower half enters the expanded crop.
+            # Remove only objects wholly above the problem number.
+            for companion in graphics:
+                if (
+                    companion != box
+                    and abs(companion.x0 - box.x0) <= 6
+                    and box.top - 25 <= companion.top
+                    and companion.bottom <= marker.top - 3
+                    and companion.x1 <= box.x0 + column_width * 0.30
+                ):
+                    padded = (
+                        companion.x0 - 3,
+                        companion.top - 3,
+                        companion.x1 + 3,
+                        companion.bottom + 3,
+                    )
+                    draw.rectangle(pdf_box_to_pixels(page, result, padded), fill="white")
+            for line in page_lines:
+                if (
+                    box.top - 25 <= line.top
+                    and line.bottom <= marker.top - 3
+                    and box.x0 - 6 <= line.x0
+                    and line.x1 <= box.x0 + column_width * 0.30
+                ):
+                    padded = (line.x0 - 2, line.top - 2, line.x1 + 2, line.bottom + 2)
+                    draw.rectangle(pdf_box_to_pixels(page, result, padded), fill="white")
+    return result
 
 
 def remove_long_decorative_rules(page, rendered: Image.Image) -> Image.Image:
@@ -613,6 +715,7 @@ def extract(
                     (marker for marker in markers if marker.column == column),
                     key=lambda marker: marker.top,
                 )
+                previous_box_bottom: float | None = None
                 for index, marker in enumerate(column_markers):
                     next_marker = column_markers[index + 1] if index + 1 < len(column_markers) else None
                     box = determine_problem_box(
@@ -628,6 +731,10 @@ def extract(
                     if box is None:
                         print(f"warning: could not determine problem {marker.number} on page {page_index + 1}")
                         continue
+                    box = prevent_previous_problem_overlap(
+                        box, marker, previous_box_bottom
+                    )
+                    previous_box_bottom = box[3]
                     page_serial += 1
                     filename = f"{page_index + 1:03d}p_{page_serial:03d}.png"
                     destination = output_dir / filename
@@ -641,6 +748,9 @@ def extract(
                         if rendered is None:
                             rendered = pdf[page_index].render(scale=scale).to_pil().convert("RGB")
                             rendered = remove_long_decorative_rules(page, rendered)
+                            rendered = remove_page_furniture(
+                                page, rendered, markers, column_count
+                            )
                         image = rendered.crop(pdf_box_to_pixels(page, rendered, box))
                         image = add_margin(image, pixel_margin)
                         atomic_png_save(image, destination)
@@ -697,3 +807,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+ 
